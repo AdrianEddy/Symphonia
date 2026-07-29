@@ -6,10 +6,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use symphonia_core::{
-    audio::{Channels, Position},
+    audio::{Channels, layouts},
     errors::{Result, decode_error, unsupported_error},
     io::ReadBytes,
 };
+
+use crate::xiph::audio::vorbis::vorbis_channels_to_channels;
 
 const OPUS_MAGIC_SIGNATURE: &[u8] = b"OpusHead";
 
@@ -59,67 +61,29 @@ impl OpusHead {
         // The next byte indicates the channel mapping. Most of these values are reserved.
         let channel_mapping = reader.read_byte()?;
 
-        let positions = match channel_mapping {
-            // RTP Mapping
-            0 if channel_count == 1 => Position::FRONT_LEFT,
-            0 if channel_count == 2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
-            // Vorbis Mapping
-            1 => match channel_count {
-                1 => Position::FRONT_LEFT,
-                2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
-                3 => Position::FRONT_LEFT | Position::FRONT_CENTER | Position::FRONT_RIGHT,
-                4 => {
-                    Position::FRONT_LEFT
-                        | Position::FRONT_RIGHT
-                        | Position::REAR_LEFT
-                        | Position::REAR_RIGHT
-                }
-                5 => {
-                    Position::FRONT_LEFT
-                        | Position::FRONT_CENTER
-                        | Position::FRONT_RIGHT
-                        | Position::REAR_LEFT
-                        | Position::REAR_RIGHT
-                }
-                6 => {
-                    Position::FRONT_LEFT
-                        | Position::FRONT_CENTER
-                        | Position::FRONT_RIGHT
-                        | Position::REAR_LEFT
-                        | Position::REAR_RIGHT
-                        | Position::LFE1
-                }
-                7 => {
-                    Position::FRONT_LEFT
-                        | Position::FRONT_CENTER
-                        | Position::FRONT_RIGHT
-                        | Position::SIDE_LEFT
-                        | Position::SIDE_RIGHT
-                        | Position::REAR_CENTER
-                        | Position::LFE1
-                }
-                8 => {
-                    Position::FRONT_LEFT
-                        | Position::FRONT_CENTER
-                        | Position::FRONT_RIGHT
-                        | Position::SIDE_LEFT
-                        | Position::SIDE_RIGHT
-                        | Position::REAR_LEFT
-                        | Position::REAR_RIGHT
-                        | Position::LFE1
-                }
-                _ => return decode_error("common (opus): invalid vorbis channel mapping"),
+        let channels = match channel_mapping {
+            // Channel mapping family 0, the RTP mapping (RFC 7845, §5.1.1.1).
+            // "Allowed numbers of channels: 1 or 2", assigned as "1 channel:
+            // monophonic (mono)" and "2 channels: stereo (left, right)". A lone
+            // Opus channel is the mono channel, which is front CENTRE — not a
+            // front-left channel that happens to be alone.
+            0 if channel_count == 1 => layouts::CHANNEL_LAYOUT_MONO,
+            0 if channel_count == 2 => layouts::CHANNEL_LAYOUT_STEREO,
+            // Channel mapping family 1 (RFC 7845, §5.1.1.2). "Allowed numbers of
+            // channels: 1...8. Vorbis channel order", and of the speaker locations
+            // it lists: "This set of surround options and speaker location
+            // orderings is the same as those used by the Vorbis codec". So it is
+            // the Vorbis table, verbatim — including "1 channel: monophonic
+            // (mono)".
+            1 => match vorbis_channels_to_channels(channel_count) {
+                Some(channels) => channels,
+                // Family 1 permits at most 8 channels.
+                None => return decode_error("common (opus): invalid vorbis channel mapping"),
             },
             // Reserved, and should NOT be supported for playback.
             _ => return unsupported_error("common (opus): unsupported channel mapping family"),
         };
 
-        Ok(Self {
-            version,
-            channels: Channels::Positioned(positions),
-            gain,
-            original_sample_rate,
-            pre_skip,
-        })
+        Ok(Self { version, channels, gain, original_sample_rate, pre_skip })
     }
 }

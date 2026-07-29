@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{AudioBuffer, AudioSpec, Channels, Position, layouts};
+use symphonia_core::audio::{AudioBuffer, AudioSpec, Channels, layouts};
 use symphonia_core::codecs::audio::AudioCodecId;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
 use symphonia_core::errors::Result;
@@ -72,14 +72,30 @@ impl ChannelMode {
     }
 
     /// Gets the the channel map.
+    ///
+    /// ISO/IEC 11172-3 assigns no loudspeaker at all to the `mode` field — it
+    /// names the four values (stereo, joint_stereo, dual_channel,
+    /// single_channel) and says nothing about where they are reproduced. The
+    /// positions come from ISO/IEC 13818-3, §0.2.3.2, which identifies the
+    /// modes with the ITU-R BS.775 configurations: "One channel, using the 1/0
+    /// configuration / Single channel mode (as in ISO/IEC 11172-3)", whose
+    /// decoder output it gives as "Front: Mono channel (Mo)" — against "Front:
+    /// Left (L) and right channel (R)" for 2/0. BS.775, normatively referenced
+    /// there, is explicit about where 1/0 goes (Annex 5, §1.1): "the mono
+    /// signal should be presented over the centre loudspeaker only".
+    ///
+    /// So a `single_channel` frame carries the mono channel, front CENTRE — not
+    /// a front-left channel that happens to be alone. ISO/IEC 14496-3 says the
+    /// same of the same audio in every other place it appears: Table 1.19 maps
+    /// channelConfiguration 1 / `single_channel_element()` to "center front
+    /// speaker", and subpart 9 labels a one-channel Layer III
+    /// `mp3_channel_element` "center (mono)".
     #[inline(always)]
     pub fn channels(&self) -> Channels {
-        let positions = match self {
-            ChannelMode::Mono => Position::FRONT_LEFT,
-            _ => Position::FRONT_LEFT | Position::FRONT_RIGHT,
-        };
-
-        Channels::Positioned(positions)
+        match self {
+            ChannelMode::Mono => layouts::CHANNEL_LAYOUT_MPEG_1P0,
+            _ => layouts::CHANNEL_LAYOUT_MPEG_2P0,
+        }
     }
 }
 

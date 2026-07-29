@@ -5,59 +5,41 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{Channels, Position};
+use symphonia_core::audio::{Channels, layouts};
 use symphonia_core::errors::{Result, decode_error};
 
 /// Get the mapping 0 channel listing for the given number of channels.
+///
+/// Vorbis I, §4.3.9 "Output channel order" assigns every count from 1 to 8,
+/// and each one is a layout Symphonia already names — as `CHANNEL_LAYOUT_OGG_*`,
+/// which is this table. Quoting the assignments, in order: "the stream is
+/// monophonic", "the stream is stereo. channel order: left, right", "the stream
+/// is a 1d-surround encoding. channel order: left, center, right", "the stream
+/// is quadraphonic surround. channel order: front left, front right, rear left,
+/// rear right", "the stream is five-channel surround. channel order: front
+/// left, center, front right, rear left, rear right", "the stream is 5.1
+/// surround. channel order: front left, center, front right, rear left, rear
+/// right, LFE", "the stream is 6.1 surround. channel order: front left, center,
+/// front right, side left, side right, rear center, LFE", and "the stream is
+/// 7.1 surround. channel order: front left, center, front right, side left,
+/// side right, rear left, rear right, LFE".
 pub fn vorbis_channels_to_channels(num_channels: u8) -> Option<Channels> {
-    let positions = match num_channels {
-        1 => Position::FRONT_LEFT,
-        2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
-        3 => Position::FRONT_LEFT | Position::FRONT_CENTER | Position::FRONT_RIGHT,
-        4 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-        }
-        5 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_CENTER
-                | Position::FRONT_RIGHT
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-        }
-        6 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_CENTER
-                | Position::FRONT_RIGHT
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-                | Position::LFE1
-        }
-        7 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_CENTER
-                | Position::FRONT_RIGHT
-                | Position::SIDE_LEFT
-                | Position::SIDE_RIGHT
-                | Position::REAR_CENTER
-                | Position::LFE1
-        }
-        8 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_CENTER
-                | Position::FRONT_RIGHT
-                | Position::SIDE_LEFT
-                | Position::SIDE_RIGHT
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-                | Position::LFE1
-        }
+    let channels = match num_channels {
+        // "the stream is monophonic" — one Vorbis channel is the mono channel,
+        // which is front CENTRE. It is not a front-left channel that happens to
+        // be alone.
+        1 => layouts::CHANNEL_LAYOUT_OGG_1P0,
+        2 => layouts::CHANNEL_LAYOUT_OGG_2P0,
+        3 => layouts::CHANNEL_LAYOUT_OGG_3P0,
+        4 => layouts::CHANNEL_LAYOUT_OGG_4P0,
+        5 => layouts::CHANNEL_LAYOUT_OGG_5P0,
+        6 => layouts::CHANNEL_LAYOUT_OGG_5P1,
+        7 => layouts::CHANNEL_LAYOUT_OGG_6P1,
+        8 => layouts::CHANNEL_LAYOUT_OGG_7P1,
         _ => return None,
     };
 
-    Some(Channels::Positioned(positions))
+    Some(channels)
 }
 
 // Xiph lacing for three packets starts with `2`, if it's not 2 assume the extradata is
@@ -115,7 +97,46 @@ pub fn unpack_xiph_laced_extradata(extradata: &[u8]) -> Result<(&[u8], &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    use symphonia_core::audio::Position;
+
     use super::*;
+
+    #[test]
+    fn test_vorbis_channels_to_channels() {
+        // "the stream is monophonic", and mono is front centre — NOT a lone
+        // front-left channel, which is what a stereo pair's left half would be.
+        assert_eq!(
+            vorbis_channels_to_channels(1),
+            Some(Channels::Positioned(Position::FRONT_CENTER))
+        );
+        assert_ne!(
+            vorbis_channels_to_channels(1),
+            Some(Channels::Positioned(Position::FRONT_LEFT))
+        );
+
+        // The remaining counts are unchanged; pin them so naming them by layout
+        // cannot silently move one.
+        #[rustfmt::skip]
+        let expected: [(u8, Channels); 7] = [
+            (2, layouts::CHANNEL_LAYOUT_OGG_2P0),
+            (3, layouts::CHANNEL_LAYOUT_OGG_3P0),
+            (4, layouts::CHANNEL_LAYOUT_OGG_4P0),
+            (5, layouts::CHANNEL_LAYOUT_OGG_5P0),
+            (6, layouts::CHANNEL_LAYOUT_OGG_5P1),
+            (7, layouts::CHANNEL_LAYOUT_OGG_6P1),
+            (8, layouts::CHANNEL_LAYOUT_OGG_7P1),
+        ];
+        for (count, channels) in expected {
+            assert_eq!(channels.count(), usize::from(count), "{count} channels");
+            assert_eq!(vorbis_channels_to_channels(count), Some(channels), "{count} channels");
+        }
+
+        // Mapping 0 defines 1 to 8 channels and nothing else.
+        assert_eq!(vorbis_channels_to_channels(0), None);
+        for count in 9..=u8::MAX {
+            assert_eq!(vorbis_channels_to_channels(count), None, "{count} channels");
+        }
+    }
 
     #[test]
     fn test_unpack_xiph_laced_extradata_valid() {

@@ -8,7 +8,7 @@
 use core::str;
 
 use log::debug;
-use symphonia_core::audio::{Channels, Position};
+use symphonia_core::audio::{Channels, layouts};
 use symphonia_core::codecs::audio::well_known::CODEC_ID_MP3;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_PCM_F32BE, CODEC_ID_PCM_F32LE};
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_PCM_F64BE, CODEC_ID_PCM_F64LE};
@@ -430,31 +430,41 @@ fn lpcm_codec_id(bits_per_sample: u32, lpcm_flags: u32) -> AudioCodecId {
 }
 
 /// Gets the audio channels for a version 0 or 1 sample entry.
+///
+/// A version 0 or 1 sound sample description states a channel COUNT, and both
+/// specifications that define one interpret exactly two counts. ISO/IEC
+/// 14496-12:2015, §12.2.3.1: "A ChannelCount of 1 indicates mono audio, and 2
+/// indicates stereo (left/right)." The QuickTime File Format Specification is
+/// narrower still for the "Number of channels" field of a version 0 sound
+/// sample description: "Set to 1 for monaural sounds, 2 for stereo sounds.
+/// Higher numbers of channels are not supported."
 fn pcm_channels(num_channels: u32) -> Result<Channels> {
     match num_channels {
-        1 => Ok(Channels::Positioned(Position::FRONT_LEFT)),
-        2 => Ok(Channels::Positioned(Position::FRONT_LEFT | Position::FRONT_RIGHT)),
+        // Monaural — one channel is the mono channel, which is front CENTRE. It
+        // is not a front-left channel that happens to be alone.
+        1 => Ok(layouts::CHANNEL_LAYOUT_MONO),
+        2 => Ok(layouts::CHANNEL_LAYOUT_STEREO),
         _ => decode_error("isomp4: invalid number of channels"),
     }
 }
 
 /// Gets the audio channels for a version 2 LPCM sample entry.
+///
+/// A version 2 sound sample description states no speaker assignment at all.
+/// The QuickTime File Format Specification defines its `numAudioChannels` field
+/// as "A 32-bit integer field set to the number of audio channels; any channel
+/// assignment will be expressed in an extension" — that extension being the
+/// optional Audio Channel Layout (`chan`) atom, which this reader does not
+/// parse. So the count is all the entry gives, and the channels are discrete
+/// until something else names them.
 fn lpcm_channels(num_channels: u32) -> Result<Channels> {
     if num_channels < 1 {
         return decode_error("isomp4: invalid number of channels");
     }
 
-    if num_channels > 32 {
-        return unsupported_error("isomp4: maximum 32 channels");
-    }
-
-    // TODO: For LPCM, the channels are "auxilary". They do not have a speaker assignment. Symphonia
-    // does not have a way to represent this yet.
-    let channel_mask = !((!0 << 1) << (num_channels - 1));
-
-    match Position::from_bits(channel_mask) {
-        Some(positions) => Ok(Channels::Positioned(positions)),
-        _ => unsupported_error("isomp4: unsupported number of channels"),
+    match u16::try_from(num_channels) {
+        Ok(count) => Ok(Channels::Discrete(count)),
+        Err(_) => unsupported_error("isomp4: unsupported number of channels"),
     }
 }
 

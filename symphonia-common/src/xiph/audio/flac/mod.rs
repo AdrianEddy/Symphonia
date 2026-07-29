@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{Channels, Position};
+use symphonia_core::audio::{Channels, layouts};
 use symphonia_core::errors::{Result, decode_error};
 use symphonia_core::io::*;
 
@@ -21,57 +21,61 @@ pub enum MetadataBlockType {
     Unknown(u8),
 }
 
+/// Map the STREAMINFO channel count to the set of channels it denotes.
+///
+/// RFC 9639, §9.1.3 "Channels bits" assigns every count from 1 to 8, and each
+/// one is a layout Symphonia already names. Quoting the assignments, in order:
+/// "1 channel: mono", "2 channels: left, right", "3 channels: left, right,
+/// center", "4 channels: front left, front right, back left, back right",
+/// "5 channels: front left, front right, front center, back/surround left,
+/// back/surround right", "6 channels: front left, front right, front center,
+/// LFE, back/surround left, back/surround right", "7 channels: front left,
+/// front right, front center, LFE, back center, side left, side right", and
+/// "8 channels: front left, front right, front center, LFE, back left, back
+/// right, side left, side right".
 fn flac_channels_to_channels(channels: u32) -> Channels {
     debug_assert!(channels > 0 && channels < 9);
 
-    let positions = match channels {
-        1 => Position::FRONT_LEFT,
-        2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
-        3 => Position::FRONT_LEFT | Position::FRONT_RIGHT | Position::FRONT_CENTER,
-        4 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-        }
-        5 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::FRONT_CENTER
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-        }
-        6 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::FRONT_CENTER
-                | Position::LFE1
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-        }
-        7 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::FRONT_CENTER
-                | Position::LFE1
-                | Position::REAR_CENTER
-                | Position::SIDE_LEFT
-                | Position::SIDE_RIGHT
-        }
-        8 => {
-            Position::FRONT_LEFT
-                | Position::FRONT_RIGHT
-                | Position::FRONT_CENTER
-                | Position::LFE1
-                | Position::REAR_LEFT
-                | Position::REAR_RIGHT
-                | Position::SIDE_LEFT
-                | Position::SIDE_RIGHT
-        }
+    match channels {
+        // "1 channel: mono" — one FLAC channel is the mono channel, which is
+        // front CENTRE. It is not a front-left channel that happens to be alone.
+        1 => layouts::CHANNEL_LAYOUT_MONO,
+        2 => layouts::CHANNEL_LAYOUT_STEREO,
+        3 => layouts::CHANNEL_LAYOUT_3P0,
+        4 => layouts::CHANNEL_LAYOUT_4P0_QUAD,
+        5 => layouts::CHANNEL_LAYOUT_5P0,
+        6 => layouts::CHANNEL_LAYOUT_5P1,
+        7 => layouts::CHANNEL_LAYOUT_6P1,
+        8 => layouts::CHANNEL_LAYOUT_7P1,
         _ => unreachable!(),
-    };
+    }
+}
 
-    Channels::Positioned(positions)
+#[test]
+fn test_flac_channels_to_channels() {
+    use symphonia_core::audio::Position;
+
+    // A single FLAC channel is "mono", and mono is front centre — NOT a lone
+    // front-left channel, which is what a stereo pair's left half would be.
+    assert_eq!(flac_channels_to_channels(1), Channels::Positioned(Position::FRONT_CENTER));
+    assert_ne!(flac_channels_to_channels(1), Channels::Positioned(Position::FRONT_LEFT));
+
+    // The remaining counts are unchanged; pin them so naming them by layout
+    // cannot silently move one.
+    #[rustfmt::skip]
+    let expected: [(u32, Channels); 7] = [
+        (2, layouts::CHANNEL_LAYOUT_STEREO),
+        (3, layouts::CHANNEL_LAYOUT_3P0),
+        (4, layouts::CHANNEL_LAYOUT_4P0_QUAD),
+        (5, layouts::CHANNEL_LAYOUT_5P0),
+        (6, layouts::CHANNEL_LAYOUT_5P1),
+        (7, layouts::CHANNEL_LAYOUT_6P1),
+        (8, layouts::CHANNEL_LAYOUT_7P1),
+    ];
+    for (count, channels) in expected {
+        assert_eq!(flac_channels_to_channels(count), channels, "{count} channels");
+        assert_eq!(flac_channels_to_channels(count).count(), count as usize, "{count} channels");
+    }
 }
 
 #[derive(Debug, Default)]

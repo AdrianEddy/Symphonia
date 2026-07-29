@@ -12,7 +12,7 @@ use std::{
     num::NonZero,
 };
 use symphonia_core::{
-    audio::{Channels, Position},
+    audio::{Channels, layouts},
     codecs::{
         CodecParameters,
         audio::{well_known::CODEC_ID_AAC, *},
@@ -390,32 +390,35 @@ impl<'s> CafReader<'s> {
 
         // TODO: Bits per sample and bits per coded sample are wrong for compressed.
 
-        match desc.channels_per_frame {
+        // The Audio Description chunk states a channel COUNT, not a layout: "the
+        // layout of the channels is described by the Channel Layout chunk". Only
+        // the counts the format itself interprets may be turned into positions
+        // here — the Channel Layout chunk, if the file has one, overwrites this.
+        let channels = match desc.channels_per_frame {
             0 => {
                 // A channel count of zero should have been rejected by the AudioDescription parser
                 unreachable!("Invalid channel count");
             }
-            1 => {
-                codec_params.with_channels(Channels::Positioned(Position::FRONT_LEFT));
-            }
-            2 => {
-                codec_params.with_channels(Channels::Positioned(
-                    Position::FRONT_LEFT | Position::FRONT_RIGHT,
-                ));
-            }
-            n => {
-                // When the channel count is >2 then enable the first N channels.
-                // This can/should be overridden when parsing the channel layout chunk.
-                match Position::from_count(n) {
-                    Some(positions) => {
-                        codec_params.with_channels(Channels::Positioned(positions));
-                    }
-                    None => {
-                        return unsupported_error("caf: unsupported channel count");
-                    }
-                }
-            }
-        }
+            // Core Audio Format Specification 1.0, "Channel Layout": "The channel
+            // layout chunk is optional for a CAF file with one or two channels.
+            // For a CAF file with one or two channels and no channel layout
+            // chunk, you can assume that a one-channel file represents monaural
+            // data and a two-channel file represents stereo with the left-channel
+            // sample first in each frame." Monaural is the mono channel, front
+            // CENTRE; "left" belongs to the two-channel branch alone.
+            1 => layouts::CHANNEL_LAYOUT_MONO,
+            2 => layouts::CHANNEL_LAYOUT_STEREO,
+            // The same paragraph is explicit that nothing may be assumed beyond
+            // that: "There is no default assumed ordering of channels in a file
+            // with more than two channels." The channels are discrete until a
+            // Channel Layout chunk says otherwise.
+            n => match u16::try_from(n) {
+                Ok(count) => Channels::Discrete(count),
+                Err(_) => return unsupported_error("caf: unsupported channel count"),
+            },
+        };
+
+        codec_params.with_channels(channels);
 
         // Need to set max_frames_per_packet in all cases in case it is needed (e.g. ADPCM).
         if desc.frames_per_packet == 1 {
@@ -488,8 +491,9 @@ impl<'s> CafReader<'s> {
                     }
                     else {
                         // Don't error if the layout doesn't correspond directly to a Symphonia
-                        // layout, the channels bitmap was set after the audio description was read
-                        // to match the number of channels, and that's probably OK.
+                        // layout. The Audio Description chunk already described the channels the
+                        // only way it can — as a count — so the track keeps that description
+                        // rather than a guess at the one this chunk failed to express.
                         info!("couldn't convert the channel layout into a channel bitmap");
                     }
                 }
