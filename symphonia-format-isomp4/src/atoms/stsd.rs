@@ -431,20 +431,23 @@ fn lpcm_codec_id(bits_per_sample: u32, lpcm_flags: u32) -> AudioCodecId {
 
 /// Gets the audio channels for a version 0 or 1 sample entry.
 ///
-/// A version 0 or 1 sound sample description states a channel COUNT, and both
-/// specifications that define one interpret exactly two counts. ISO/IEC
-/// 14496-12:2015, §12.2.3.1: "A ChannelCount of 1 indicates mono audio, and 2
-/// indicates stereo (left/right)." The QuickTime File Format Specification is
-/// narrower still for the "Number of channels" field of a version 0 sound
-/// sample description: "Set to 1 for monaural sounds, 2 for stereo sounds.
-/// Higher numbers of channels are not supported."
+/// A version 0 or 1 sound sample description states a channel COUNT, and the
+/// specification interprets exactly two of them. ISO/IEC 14496-12:2015,
+/// §12.2.3.1: "A ChannelCount of 1 indicates mono audio, and 2 indicates stereo
+/// (left/right). When values greater than 2 are used, the codec configuration
+/// should identify the channel assignment." A PCM sample entry has no codec
+/// configuration to consult, so above two channels the count is all there is.
 fn pcm_channels(num_channels: u32) -> Result<Channels> {
     match num_channels {
+        0 => decode_error("isomp4: invalid number of channels"),
         // Monaural — one channel is the mono channel, which is front CENTRE. It
         // is not a front-left channel that happens to be alone.
         1 => Ok(layouts::CHANNEL_LAYOUT_MONO),
         2 => Ok(layouts::CHANNEL_LAYOUT_STEREO),
-        _ => decode_error("isomp4: invalid number of channels"),
+        n => match u16::try_from(n) {
+            Ok(count) => Ok(Channels::Discrete(count)),
+            Err(_) => unsupported_error("isomp4: unsupported number of channels"),
+        },
     }
 }
 
