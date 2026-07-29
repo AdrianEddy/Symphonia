@@ -8,14 +8,14 @@
 use std::fmt;
 
 use symphonia_core::audio::AmbisonicBFormat;
-use symphonia_core::audio::{ChannelLabel, Channels, Position};
+use symphonia_core::audio::{ChannelLabel, Channels, Position, layouts};
 use symphonia_core::codecs::audio::AudioCodecId;
 use symphonia_core::codecs::audio::well_known::{
     CODEC_ID_ADPCM_IMA_WAV, CODEC_ID_ADPCM_MS, CODEC_ID_PCM_ALAW, CODEC_ID_PCM_F32LE,
     CODEC_ID_PCM_F64LE, CODEC_ID_PCM_MULAW, CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24LE,
     CODEC_ID_PCM_S32LE, CODEC_ID_PCM_U8,
 };
-use symphonia_core::errors::{Error, Result, decode_error, unsupported_error};
+use symphonia_core::errors::{Result, decode_error, unsupported_error};
 use symphonia_core::formats::Track;
 use symphonia_core::io::{MediaSourceStream, ReadBytes};
 use symphonia_core::meta::{MetadataBuilder, MetadataRevision};
@@ -333,6 +333,19 @@ impl WaveFormatChunk {
                 // For Ambisonic B-format, use the number of channels to map to Ambisonic B-Format
                 // channel components.
                 map_amb_channel_count(num_channels)?
+            }
+            _ if channel_mask == 0 => {
+                // A zero channel mask is not an absent one. WAVEFORMATEXTENSIBLE defines it to
+                // mean that no channel has a speaker location: "a dwChannelMask of 0 tells the
+                // audio device to render the first channel to the first port on the device, the
+                // second channel to the second port on the device, and so on". The channels are
+                // discrete, and unlike the maskless header above that holds for one and two
+                // channels too — the producer said so explicitly.
+                if num_channels == 0 {
+                    return decode_error("riff: invalid channel count");
+                }
+
+                Channels::Discrete(num_channels)
             }
             _ => {
                 // For PCM audio, use the channel mask and number of channels to map to positioned
@@ -712,27 +725,39 @@ fn test_fix_channel_mask() {
     assert_eq!(fix_wave_channel_mask(0xFFFFFFFF, 8), 0b11111111);
 }
 
-/// Map a WAVE channel count to a set of channels.
+/// Map a WAVE channel count to a set of channels for a header that does not carry a channel mask.
 fn map_wave_channel_count(count: u16) -> Result<Channels> {
-    // There must be atleast one channel.
-    (1..)
-        .contains(&count)
-        .then(|| Position::from_count(u32::from(count)))
-        .flatten()
-        .map(Channels::Positioned)
-        .ok_or(Error::DecodeError("riff: invalid channel count"))
+    let channels = match count {
+        // There must be atleast one channel.
+        0 => return decode_error("riff: invalid channel count"),
+        // A WAVEFORMAT or WAVEFORMATEX header has no dwChannelMask, so the only speaker
+        // assignments that may be assumed are the ones the format has always implied. Microsoft's
+        // "Multiple channel audio data and WAVE files" states that for WAVE_FORMAT_PCM "the
+        // stereo-speaker configuration was always assumed, and since nChannels was always one or
+        // two, it was easy to map these to a pair of speakers".
+        1 => layouts::CHANNEL_LAYOUT_MONO,
+        2 => layouts::CHANNEL_LAYOUT_STEREO,
+        // The same document is explicit that there is nothing to assume beyond that: "a
+        // channel-to-speaker specification for WAVE_FORMAT_PCM will continue to be undocumented
+        // for the case of nChannels > 2". Treat these cases as discrete channels rather than
+        // inventing positions the file never stated.
+        _ => Channels::Discrete(count),
+    };
+    Ok(channels)
 }
 
 #[test]
 fn test_map_wave_channel_count() {
     assert!(map_wave_channel_count(0).is_err());
 
-    for i in 1..27 {
-        assert!(map_wave_channel_count(i).is_ok());
-    }
+    // A maskless header only ever implies mono or stereo.
+    assert_eq!(map_wave_channel_count(1).unwrap(), layouts::CHANNEL_LAYOUT_MONO);
+    assert_eq!(map_wave_channel_count(2).unwrap(), layouts::CHANNEL_LAYOUT_STEREO);
 
-    for i in 27..u16::MAX {
-        assert!(map_wave_channel_count(i).is_err());
+    // Every other count is discrete, and no count is rejected: the channel positions were never
+    // the thing that bounded it.
+    for i in 3..u16::MAX {
+        assert_eq!(map_wave_channel_count(i).unwrap(), Channels::Discrete(i));
     }
 }
 
