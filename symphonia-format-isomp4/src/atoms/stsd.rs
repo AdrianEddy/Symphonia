@@ -290,7 +290,7 @@ impl Atom for AudioSampleEntry {
                     entry.bits_per_sample = Some(bits_per_sample);
                     entry.bits_per_coded_sample = Some(bits_per_sample);
                     entry.frames_per_packet = Some(u64::from(lpcm_frames_per_packet));
-                    entry.channels = Some(lpcm_channels(entry.num_channels)?);
+                    entry.channels = Some(pcm_channels(entry.num_channels)?);
                 }
             }
             _ => {
@@ -429,14 +429,18 @@ fn lpcm_codec_id(bits_per_sample: u32, lpcm_flags: u32) -> AudioCodecId {
     }
 }
 
-/// Gets the audio channels for a version 0 or 1 sample entry.
+/// Gets the audio channels for a PCM sample entry of any version.
 ///
-/// A version 0 or 1 sound sample description states a channel COUNT, and the
-/// specification interprets exactly two of them. ISO/IEC 14496-12:2015,
-/// §12.2.3.1: "A ChannelCount of 1 indicates mono audio, and 2 indicates stereo
-/// (left/right). When values greater than 2 are used, the codec configuration
-/// should identify the channel assignment." A PCM sample entry has no codec
-/// configuration to consult, so above two channels the count is all there is.
+/// A sound sample description states a channel COUNT, and the specifications
+/// interpret exactly two of them. ISO/IEC 14496-12:2015, §12.2.3.1: "A
+/// ChannelCount of 1 indicates mono audio, and 2 indicates stereo (left/right).
+/// When values greater than 2 are used, the codec configuration should identify
+/// the channel assignment." A PCM sample entry has no codec configuration to
+/// consult. The `numAudioChannels` field of a version 2 entry says no more: the
+/// QuickTime File Format Specification defines it as "the number of audio
+/// channels; any channel assignment will be expressed in an extension" — the
+/// optional Audio Channel Layout (`chan`) atom, which this reader does not
+/// parse. So above two channels the count is all there is.
 fn pcm_channels(num_channels: u32) -> Result<Channels> {
     match num_channels {
         0 => decode_error("isomp4: invalid number of channels"),
@@ -448,26 +452,6 @@ fn pcm_channels(num_channels: u32) -> Result<Channels> {
             Ok(count) => Ok(Channels::Discrete(count)),
             Err(_) => unsupported_error("isomp4: unsupported number of channels"),
         },
-    }
-}
-
-/// Gets the audio channels for a version 2 LPCM sample entry.
-///
-/// A version 2 sound sample description states no speaker assignment at all.
-/// The QuickTime File Format Specification defines its `numAudioChannels` field
-/// as "A 32-bit integer field set to the number of audio channels; any channel
-/// assignment will be expressed in an extension" — that extension being the
-/// optional Audio Channel Layout (`chan`) atom, which this reader does not
-/// parse. So the count is all the entry gives, and the channels are discrete
-/// until something else names them.
-fn lpcm_channels(num_channels: u32) -> Result<Channels> {
-    if num_channels < 1 {
-        return decode_error("isomp4: invalid number of channels");
-    }
-
-    match u16::try_from(num_channels) {
-        Ok(count) => Ok(Channels::Discrete(count)),
-        Err(_) => unsupported_error("isomp4: unsupported number of channels"),
     }
 }
 
@@ -753,5 +737,21 @@ impl Atom for PaspAtom {
             vert_off_n: it.read_u32()?,
             vert_off_d: it.read_u32()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pcm_channels() {
+        assert!(pcm_channels(0).is_err());
+        assert_eq!(pcm_channels(1).ok(), Some(layouts::CHANNEL_LAYOUT_MONO));
+        assert_eq!(pcm_channels(2).ok(), Some(layouts::CHANNEL_LAYOUT_STEREO));
+        assert_eq!(pcm_channels(4).ok(), Some(Channels::Discrete(4)));
+        // More channels than there are speaker positions.
+        assert_eq!(pcm_channels(64).ok(), Some(Channels::Discrete(64)));
+        assert!(pcm_channels(u32::MAX).is_err());
     }
 }
