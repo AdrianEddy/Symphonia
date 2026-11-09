@@ -29,7 +29,10 @@ pub struct OpusAtom {
 impl Atom for OpusAtom {
     fn read<R: ReadAtom>(reader: &mut AtomIterator<R>, header: &AtomHeader) -> Result<Self> {
         const MIN_OPUS_EXTRA_DATA_SIZE: usize = OPUS_MAGIC_LEN + 11;
-        const MAX_OPUS_EXTRA_DATA_SIZE: usize = MIN_OPUS_EXTRA_DATA_SIZE + 257;
+        // The largest identification header has a channel mapping table of a stream count, a
+        // coupled stream count, and a demixing matrix of a 16-bit coefficient for each of up to
+        // 255 coded and 255 output channels (channel mapping family 3, RFC 8486, §3.2).
+        const MAX_OPUS_EXTRA_DATA_SIZE: usize = MIN_OPUS_EXTRA_DATA_SIZE + 2 + 2 * 255 * 255;
 
         // Offset of the Opus version number in the extra data.
         const OPUS_EXTRADATA_VERSION_OFFSET: usize = OPUS_MAGIC_LEN;
@@ -63,6 +66,16 @@ impl Atom for OpusAtom {
             return unsupported_error("isomp4 (opus): unsupported opus version");
         }
 
+        // The dops atom stores the identification header with a version of 0 and its multi-byte
+        // fields in big-endian byte order, while the extra data is the identification header
+        // (RFC 7845, §5.1): version 1 and little-endian. The fields are otherwise identical, and
+        // the channel mapping is single bytes, so rewrite the version, the pre-skip, the input
+        // sample rate, and the output gain (as FFmpeg's `mov_read_dops` does).
+        extra_data[OPUS_EXTRADATA_VERSION_OFFSET] = 1;
+        extra_data[OPUS_MAGIC_LEN + 2..OPUS_MAGIC_LEN + 4].reverse();
+        extra_data[OPUS_MAGIC_LEN + 4..OPUS_MAGIC_LEN + 8].reverse();
+        extra_data[OPUS_MAGIC_LEN + 8..OPUS_MAGIC_LEN + 10].reverse();
+
         Ok(OpusAtom { extra_data })
     }
 }
@@ -71,7 +84,7 @@ impl OpusAtom {
     pub fn fill_audio_sample_entry(self, entry: &mut AudioSampleEntry) {
         let mut reader = BufReader::new(&self.extra_data);
 
-        if let Ok(opus_head) = opus::OpusHead::read(&mut reader, 0) {
+        if let Ok(opus_head) = opus::OpusHead::read(&mut reader, 1) {
             entry.channels = Some(opus_head.channels);
             entry.sample_rate = 48_000.0;
         }

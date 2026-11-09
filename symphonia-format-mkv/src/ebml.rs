@@ -274,6 +274,12 @@ pub(crate) struct EbmlIteratorState<S: EbmlSchema> {
     pos: u64,
 }
 
+impl<S: EbmlSchema> Clone for EbmlIteratorState<S> {
+    fn clone(&self) -> Self {
+        Self { stack: self.stack.clone(), current: self.current, pos: self.pos }
+    }
+}
+
 /// An EBML document iterator supporting hierarchical traversal.
 pub(crate) struct EbmlIterator<R: ReadEbml, S: EbmlSchema> {
     /// The inner reader.

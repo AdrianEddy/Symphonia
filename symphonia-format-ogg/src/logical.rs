@@ -129,6 +129,14 @@ impl LogicalStream {
         // Keep a copy of the previous page information.
         let prev_page_info = self.prev_page_info.take();
 
+        // After a discontinuity, if this page is the first bitstream page of the stream, the
+        // packets that follow are the first packets of the stream again.
+        if prev_page_info.is_none()
+            && self.start_bound.is_some_and(|b| b.seq == page.header.sequence)
+        {
+            self.mapper.rewind();
+        }
+
         // Update with new page information.
         self.prev_page_info = Some(PageInfo {
             seq: page.header.sequence,
@@ -272,15 +280,27 @@ impl LogicalStream {
                     // For the last page, this calculation fails because the total packet duration
                     // includes the padding and it is not possible to know how many frames are
                     // valid. If the end bound is known, the correct page start timestamp can be
-                    // found.
+                    // found. A seek doesn't land on the last page for this reason (see
+                    // `OggReader::do_seek`).
                     page_start_ts_raw
                 }
             };
 
             let mut next_pkt_pts = page_start_ts;
 
+            // Frames decoded before the track's first presented frame are the delay, wherever
+            // reading began: a seek may land on a later page of a delay that outlasts the first
+            // page. The track's start is settled once the physical stream is open, after its
+            // initial pages are read.
+            let start_ts = (!is_init_page).then(|| self.mapper.track().start_ts);
+
             for packet in self.packets.iter_mut().skip(num_prev_packets) {
                 packet.pts = next_pkt_pts;
+
+                // Trim the frames before the track's start. Don't trim more frames than available.
+                if let Some(delay) = start_ts.and_then(|ts| ts.duration_from(packet.pts)) {
+                    packet.trim_start = packet.trim_start.max(delay.min(packet.dur));
+                }
 
                 // The packet's duration is populated with the packet's decoded duration (includes
                 // delay and padding). Calculate the next packet's PTS. This is also the end PTS of
@@ -383,13 +403,18 @@ impl LogicalStream {
             discard: total_pkt_discard,
         };
 
-        // Update codec parameters.
+        // Update codec parameters. The track starts at its first presented frame, the first frame
+        // after the frames discarded from the start of the stream (the delay). A delay the mapper
+        // read from the stream's header (e.g., the Opus pre-skip) may outlast this page, whose
+        // discard is then only the delay's first part.
         let track = self.mapper.track_mut();
 
-        track.with_start_ts(bound.ts);
+        let delay = Duration::from(u64::from(track.delay.unwrap_or(0))).max(bound.discard);
 
-        if bound.discard > Duration::ZERO {
-            track.with_delay(bound.discard.get() as u32);
+        track.with_start_ts(bound.ts.saturating_add(delay));
+
+        if delay > Duration::ZERO {
+            track.with_delay(delay.get() as u32);
         }
 
         // Update start bound.

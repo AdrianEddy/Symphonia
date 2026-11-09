@@ -18,6 +18,7 @@ mod codecs;
 mod demuxer;
 mod ebml;
 mod lacing;
+mod opus;
 mod schema;
 mod segment;
 mod tags;

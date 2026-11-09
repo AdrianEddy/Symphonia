@@ -45,6 +45,8 @@ pub(crate) mod moov;
 pub(crate) mod mvex;
 pub(crate) mod mvhd;
 pub(crate) mod opus;
+pub(crate) mod sbgp;
+pub(crate) mod sgpd;
 pub(crate) mod sidx;
 pub(crate) mod smhd;
 pub(crate) mod stbl;
@@ -92,6 +94,8 @@ pub use moov::MoovAtom;
 pub use mvex::MvexAtom;
 pub use mvhd::MvhdAtom;
 pub use opus::OpusAtom;
+pub use sbgp::SbgpAtom;
+pub use sgpd::SgpdAtom;
 pub use sidx::SidxAtom;
 pub use smhd::SmhdAtom;
 pub use stbl::StblAtom;
@@ -220,9 +224,11 @@ pub enum AtomType {
     RatingTag,
     RecordingCopyrightTag,
     SampleDescription,
+    SampleGroupDescription,
     SampleSize,
     SampleTable,
     SampleToChunk,
+    SampleToGroup,
     SegmentIndex,
     ShowMovementTag,
     Skip,
@@ -331,7 +337,9 @@ impl From<[u8; 4]> for AtomType {
             b"Opus" => AtomType::AudioSampleEntryOpus,
             b"pasp" => AtomType::PixelAspectRatio,
             b"raw " => AtomType::AudioSampleEntryU8,
+            b"sbgp" => AtomType::SampleToGroup,
             b"sbtt" => AtomType::SubtitleSampleEntryText,
+            b"sgpd" => AtomType::SampleGroupDescription,
             b"sidx" => AtomType::SegmentIndex,
             b"skip" => AtomType::Skip,
             b"smhd" => AtomType::SoundMediaHeader,
@@ -852,8 +860,9 @@ impl<R: ReadAtom> AtomIterator<R> {
     where
         R: MediaSource,
     {
-        // Must currently have a pending atom to allow resynchronizing to it.
-        let _ = self.pending.as_ref().ok_or(AtomError::NoPendingAtom)?;
+        // If there is a pending atom, the caller resynchronizes the iterator to it before iterating
+        // atoms again (see `seek_atom_end`). If there is none, all atoms have been iterated, and
+        // the caller iterates no more atoms.
 
         // Seek to the desired position. Doesn't seek if already in position.
         self.seek_reader(pos)?;

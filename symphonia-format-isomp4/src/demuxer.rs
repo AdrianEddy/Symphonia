@@ -5,7 +5,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use symphonia_common::mpeg::audio::AudioSpecificConfig;
+use symphonia_common::xiph::audio::opus::{self, OPUS_SAMPLE_RATE};
 use symphonia_core::codecs::CodecParameters;
+use symphonia_core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_OPUS};
 use symphonia_core::support_format;
 
 use symphonia_core::errors::{
@@ -25,6 +28,7 @@ use std::sync::Arc;
 
 use crate::atoms::{AtomError, AtomIterator, AtomType, ReadAtom};
 use crate::atoms::{FtypAtom, MetaAtom, MoofAtom, MoovAtom, SidxAtom, TrakAtom};
+use crate::edit::{Presentation, rescale};
 use crate::stream::*;
 
 use log::{debug, info, trace, warn};
@@ -34,6 +38,21 @@ const ISOMP4_FORMAT_INFO: FormatInfo = FormatInfo {
     short_name: "isomp4",
     long_name: "ISO Base Media File Format",
 };
+
+/// The amount of audio to decode before the seek target to let an Opus decoder converge, 80 ms
+/// (RFC 7845, §4.6), in frames at 48 kHz.
+const OPUS_SEEK_PRE_ROLL: u64 = 80 * OPUS_SAMPLE_RATE as u64 / 1000;
+
+/// The number of frames a sample of an audio track decodes to.
+#[derive(Copy, Clone, Debug)]
+enum DecodedLength {
+    /// Read from the TOC of each Opus packet.
+    Opus,
+    /// Every sample decodes to the same number of frames (an AAC frame).
+    Fixed(u64),
+    /// The duration of the sample.
+    Duration,
+}
 
 pub struct TrackState {
     /// The track number.
@@ -46,10 +65,30 @@ pub struct TrackState {
     next_sample: u32,
     /// The current sample byte position relative to the start of the track.
     next_sample_pos: u64,
+    /// The media timescale.
+    timescale: NonZero<u32>,
+    /// For an audio track, the sample rate of the decoded audio.
+    sample_rate: Option<NonZero<u32>>,
+    /// The number of frames a sample decodes to.
+    decoded_len: DecodedLength,
+    /// For an audio track, the presentation of its media, if known: the one its edit list states,
+    /// or else all of the media.
+    presentation: Option<Presentation>,
+    /// The least duration, in the media timescale, that a seek begins decoding before its target,
+    /// whatever the roll recovery group states: Opus's 80 ms, or else 0.
+    seek_pre_roll: u64,
 }
 
 impl TrackState {
-    pub fn make(track_num: usize, trak: &TrakAtom, timespan: &TimeSpan) -> (Self, Track) {
+    /// Make the state and the track of the track atom `trak`. The track's media ends at
+    /// `media_end`, if its sample table states it.
+    pub fn make(
+        track_num: usize,
+        trak: &TrakAtom,
+        timespan: &TimeSpan,
+        media_end: Option<u64>,
+        movie_timescale: NonZero<u32>,
+    ) -> (Self, Track) {
         let mut track = Track::new(trak.tkhd.id);
 
         // Create the codec parameters using the sample description atom.
@@ -57,19 +96,111 @@ impl TrackState {
             track.with_codec_params(codec_params);
         }
 
+        let timescale = timespan.timescale;
+
+        // The rate of the decoded audio, and the number of frames each sample decodes to. An Opus
+        // track always decodes at 48 kHz. An AAC sample decodes to a frame of the length its audio
+        // specific config states, even if the duration of the last sample is shortened to its
+        // valid frames, at the rate the config states. The sample entry may state another rate:
+        // the SBR output rate under implicit SBR (as the media timescale does), or, from FFmpeg,
+        // half of a rate above 65535 Hz.
+        let (sample_rate, decoded_len) = match &track.codec_params {
+            Some(CodecParameters::Audio(audio)) => match audio.codec {
+                CODEC_ID_OPUS => (NonZero::new(OPUS_SAMPLE_RATE), DecodedLength::Opus),
+                CODEC_ID_AAC => match audio
+                    .extra_data
+                    .as_deref()
+                    .and_then(|asc| AudioSpecificConfig::read(asc).ok())
+                    .filter(|asc| asc.samples > 0)
+                {
+                    Some(asc) => {
+                        (NonZero::new(asc.sample_rate), DecodedLength::Fixed(asc.samples as u64))
+                    }
+                    None => (audio.sample_rate.and_then(NonZero::new), DecodedLength::Duration),
+                },
+                _ => (audio.sample_rate.and_then(NonZero::new), DecodedLength::Duration),
+            },
+            _ => (None, DecodedLength::Duration),
+        };
+
+        // An Opus decoder converges within 80 ms, so a seek begins decoding at least that long
+        // before its target (RFC 7845, §4.6), as FFmpeg's MP4 reader states for every Opus track. A
+        // roll recovery group may state a longer pre-roll, but not a shorter one. FFmpeg's states
+        // none for the first 80 ms of the track, nor anywhere in a fragmented file.
+        let seek_pre_roll = match (decoded_len, sample_rate) {
+            (DecodedLength::Opus, Some(sample_rate)) => {
+                rescale(OPUS_SEEK_PRE_ROLL, sample_rate, timescale)
+            }
+            _ => 0,
+        };
+
+        // The presentation of an audio track's media: the one its edit list states, or else all of
+        // the media if its end is known. Neither presents past the end of the media.
+        let presentation = sample_rate.and_then(|_| {
+            trak.edts
+                .as_ref()
+                .and_then(|edts| edts.elst.as_ref())
+                .and_then(|elst| Presentation::from_edit_list(elst, movie_timescale, timescale))
+                .or_else(|| media_end.map(|_| Presentation::whole()))
+                .map(|presentation| presentation.bounded_by(media_end))
+        });
+
+        // The presented duration excludes the trimmed frames.
+        let duration = match presentation {
+            Some(presentation) => match presentation.media_end() {
+                Some(media_end) => media_end - presentation.media_start(),
+                None => timespan.duration.get().saturating_sub(presentation.media_start()),
+            },
+            None => timespan.duration.get(),
+        };
+
         // Populate timing information.
         track
             .with_time_base(TimeBase::from_recip(timespan.timescale))
-            .with_duration(timespan.duration);
+            .with_duration(duration.into());
 
         // If the track is an audio track, and the timescale is equal to the sample rate, then the
         // number of frames is equal to the duration. This is the case for almost all audio tracks.
         // If not, there is no generic, low overhead, & precise way to determine the number of
         // frames.
-        if let Some(CodecParameters::Audio(audio)) = &track.codec_params {
-            if let Some(sample_rate) = audio.sample_rate {
-                if sample_rate == timespan.timescale.get() {
-                    track.with_num_frames(timespan.duration.get());
+        if sample_rate == Some(timescale) {
+            track.with_num_frames(duration);
+        }
+
+        // The frames before the presentation are the encoder delay, and the frames after it are
+        // padding.
+        if let (Some(presentation), Some(sample_rate)) = (presentation, sample_rate) {
+            track.with_start_ts(Timestamp::from(presentation.start_ts() as i64));
+
+            let delay = rescale(presentation.media_start(), timescale, sample_rate);
+
+            if let Ok(delay @ 1..) = u32::try_from(delay) {
+                track.with_delay(delay);
+            }
+
+            // The padding is known from the sample table if each sample decodes to its duration,
+            // or to a fixed number of frames.
+            let stts = &trak.mdia.minf.stbl.stts;
+
+            let decoded_end = match decoded_len {
+                DecodedLength::Duration => Some(stts.total_duration),
+                // The last sample is in the last entry that states any samples. It starts its
+                // duration before the end of the table, and decodes to a whole frame.
+                DecodedLength::Fixed(frame_len) => {
+                    stts.entries.iter().rfind(|entry| entry.sample_count > 0).and_then(|last| {
+                        let last_start = stts.total_duration - u64::from(last.sample_delta);
+                        last_start.checked_add(rescale(frame_len, sample_rate, timescale))
+                    })
+                }
+                DecodedLength::Opus => None,
+            };
+
+            if let (Some(media_end), Some(decoded_end)) = (presentation.media_end(), decoded_end) {
+                let padding =
+                    rescale(decoded_end.saturating_sub(media_end), timescale, sample_rate);
+
+                if let Ok(padding @ 1..) = u32::try_from(padding) {
+                    track.with_padding(padding);
                 }
             }
         }
@@ -80,9 +211,54 @@ impl TrackState {
             cur_seg: 0,
             next_sample: 0,
             next_sample_pos: 0,
+            timescale,
+            sample_rate,
+            decoded_len,
+            presentation,
+            seek_pre_roll,
         };
 
         (state, track)
+    }
+
+    /// Make the packet of the sample of the track at the media timestamp `ts` with the duration
+    /// `dur`.
+    ///
+    /// The packet's timestamp is its presentation timestamp, and the frames it decodes to outside
+    /// the presentation are trimmed.
+    fn make_packet(&self, ts: Timestamp, dur: Duration, data: Box<[u8]>) -> Packet {
+        let (Some(presentation), Some(sample_rate)) = (self.presentation, self.sample_rate)
+        else {
+            return Packet::new(self.track_id, ts, dur, data);
+        };
+
+        let ts = ts.get() as u64;
+
+        // The duration of the frames the sample decodes to. The duration of the last sample of an
+        // Opus or AAC track is shortened to its valid frames (for Opus, Opus in ISOBMFF, §4.3.4),
+        // but it decodes to as many frames as any other.
+        let decoded_frames = match self.decoded_len {
+            DecodedLength::Opus => opus::packet_frames(&data).map(u64::from),
+            DecodedLength::Fixed(frame_len) => Some(frame_len),
+            DecodedLength::Duration => None,
+        };
+
+        let decoded = match decoded_frames {
+            Some(frames) => rescale(frames, sample_rate, self.timescale),
+            None => dur.get(),
+        };
+
+        let (trim_start, trim_end) = presentation.trims(ts, decoded);
+
+        let pts = Timestamp::from(presentation.media_to_pts(ts));
+        let mut packet =
+            Packet::new(self.track_id, pts, Duration::new(decoded - trim_start - trim_end), data);
+
+        // The trims are in decoded frames.
+        packet.trim_start = Duration::new(rescale(trim_start, self.timescale, sample_rate));
+        packet.trim_end = Duration::new(rescale(trim_end, self.timescale, sample_rate));
+
+        packet
     }
 }
 
@@ -91,11 +267,9 @@ impl TrackState {
 struct NextSampleInfo {
     /// The track number of the next sample.
     track_num: usize,
-    /// The track id.
-    track_id: u32,
-    /// The timestamp of the next sample.
+    /// The media timestamp of the next sample.
     ts: Timestamp,
-    /// The timestamp expressed in seconds.
+    /// The presentation time of the next sample, in seconds.
     time: Time,
     /// The duration of the next sample.
     dur: Duration,
@@ -145,6 +319,8 @@ pub struct IsoMp4Reader<'s> {
     track_states: Vec<TrackState>,
     /// Optional, movie extends atom used for fragmented streams.
     moov: Arc<MoovAtom>,
+    /// All atoms of the stream have been iterated, so no more segments can be read.
+    atoms_ended: bool,
 }
 
 impl<'s> IsoMp4Reader<'s> {
@@ -315,7 +491,13 @@ impl<'s> IsoMp4Reader<'s> {
                 TimeSpan::new(trak.mdia.mdhd.timescale, duration)
             };
 
-            let (track_state, track) = TrackState::make(t, trak, &timespan);
+            // The end of the media, if the sample table states it. A fragmented file's samples
+            // are in its fragments.
+            let media_end =
+                (!moov.is_fragmented()).then_some(trak.mdia.minf.stbl.stts.total_duration);
+
+            let (track_state, track) =
+                TrackState::make(t, trak, &timespan, media_end, moov.mvhd.timescale);
 
             tracks.push(track);
             track_states.push(track_state);
@@ -338,11 +520,20 @@ impl<'s> IsoMp4Reader<'s> {
         media_info.with_time_base(TimeBase::from_recip(moov.mvhd.timescale));
         media_info.with_duration(Duration::new(moov.mvhd.duration));
 
-        Ok(IsoMp4Reader { iter: it, media_info, tracks, metadata, track_states, segs, moov })
+        Ok(IsoMp4Reader {
+            iter: it,
+            media_info,
+            tracks,
+            metadata,
+            track_states,
+            segs,
+            moov,
+            atoms_ended: false,
+        })
     }
 
     /// Idempotently gets information regarding the next sample of the media stream. This function
-    /// selects the next sample with the lowest timestamp of all tracks.
+    /// selects the next sample with the lowest presentation time of all tracks.
     fn next_sample_info(&self) -> Result<Option<NextSampleInfo>> {
         let mut earliest = None;
 
@@ -358,13 +549,20 @@ impl<'s> IsoMp4Reader<'s> {
             for (seg_idx_delta, seg) in self.segs[state.cur_seg..].iter().enumerate() {
                 // Try to get the timestamp for the next sample of the track from the segment.
                 if let Some(timing) = seg.sample_timing(state.track_num, state.next_sample)? {
-                    // Calculate the presentation time using the timestamp.
                     let Some(ts) = timing.ts.try_into().ok()
                     else {
                         return Ok(None);
                     };
 
-                    let Some(sample_time) = tb.calc_time(ts)
+                    // Calculate the presentation time on the timeline the track's packets are
+                    // stamped with: the presentation of an audio track's media, if known, or else
+                    // the media's.
+                    let pts = match state.presentation {
+                        Some(presentation) => Timestamp::from(presentation.media_to_pts(timing.ts)),
+                        None => ts,
+                    };
+
+                    let Some(sample_time) = tb.calc_time(pts)
                     else {
                         return Ok(None);
                     };
@@ -381,7 +579,6 @@ impl<'s> IsoMp4Reader<'s> {
                             // presentation time. Update earliest.
                             earliest = Some(NextSampleInfo {
                                 track_num: state.track_num,
-                                track_id: state.track_id,
                                 ts,
                                 time: sample_time,
                                 dur: Duration::from(timing.dur),
@@ -442,6 +639,13 @@ impl<'s> IsoMp4Reader<'s> {
             return Ok(false);
         }
 
+        // If all atoms were iterated, then there are no more segments. The reader has since been
+        // used to read samples, so iterating atoms again would read from wherever the last sample
+        // ended.
+        if self.atoms_ended {
+            return Ok(false);
+        }
+
         // Continue iterating over atoms until a segment (a moof + mdat atom pair) is found. All
         // other atoms will be ignored.
         loop {
@@ -494,6 +698,8 @@ impl<'s> IsoMp4Reader<'s> {
         }
 
         // If no atoms were returned above, then the end-of-stream has been reached.
+        self.atoms_ended = true;
+
         Ok(false)
     }
 
@@ -522,13 +728,22 @@ impl<'s> IsoMp4Reader<'s> {
             return seek_error(SeekErrorKind::OutOfRange);
         }
 
+        // The timestamp is a presentation timestamp. Get the media timestamp it presents.
+        let presentation = self.track_states[track_num].presentation;
+        let seek_pre_roll = self.track_states[track_num].seek_pre_roll;
+
+        let media_ts = match presentation {
+            Some(presentation) => presentation.pts_to_media(ts.get() as u64),
+            None => ts.get() as u64,
+        };
+
         let mut seg_skip = 0;
 
-        let seek_loc = 'locate: loop {
+        let mut seek_loc = 'locate: loop {
             // Iterate over all segments and attempt to find the segment and sample number that
             // contains the desired timestamp. Skip segments already examined.
             for (seg_idx, seg) in self.segs.iter().enumerate().skip(seg_skip) {
-                if let Some(sample_num) = seg.ts_sample(track_num, ts.get() as u64)? {
+                if let Some(sample_num) = seg.ts_sample(track_num, media_ts)? {
                     break 'locate SeekLocation { seg_idx, sample_num };
                 }
 
@@ -542,6 +757,39 @@ impl<'s> IsoMp4Reader<'s> {
             }
         };
 
+        // If samples before the sample must be decoded for it to be decoded correctly (the
+        // pre-roll), begin decoding at the first of them. The roll recovery group states how many
+        // there are, and the track's seek pre-roll how long before the target they begin at the
+        // least. The longer pre-roll of the two is taken.
+        let mut sample_num = match &self.moov.traks[track_num].mdia.minf.stbl.roll {
+            Some(roll) => seek_loc.sample_num.saturating_sub(roll.pre_roll(seek_loc.sample_num)),
+            None => seek_loc.sample_num,
+        };
+
+        if seek_pre_roll > 0 {
+            let start = media_ts.saturating_sub(seek_pre_roll);
+
+            // The sample holding the start of the pre-roll, which may be in an earlier segment.
+            if let Some(seg) = self.segs[..=seek_loc.seg_idx]
+                .iter()
+                .rfind(|seg| seg.track_ts_range(track_num).contains(&start))
+            {
+                if let Some(start_sample_num) = seg.ts_sample(track_num, start)? {
+                    sample_num = sample_num.min(start_sample_num);
+                }
+            }
+        }
+
+        if sample_num < seek_loc.sample_num {
+            // The pre-roll may begin in an earlier segment.
+            if let Some(seg_idx) = self.segs[..=seek_loc.seg_idx]
+                .iter()
+                .rposition(|seg| seg.track_sample_range(track_num).contains(&sample_num))
+            {
+                seek_loc = SeekLocation { seg_idx, sample_num };
+            }
+        }
+
         let seg = &self.segs[seek_loc.seg_idx];
 
         // Get the sample timing.
@@ -550,10 +798,13 @@ impl<'s> IsoMp4Reader<'s> {
             None => return seek_error(SeekErrorKind::OutOfRange),
         };
 
-        // Try to convert the sample timing to a timestamp.
-        let actual_ts = match Timestamp::try_from(timing.ts) {
-            Ok(ts) => ts,
-            _ => return seek_error(SeekErrorKind::OutOfRange),
+        // Try to convert the sample timing to a presentation timestamp.
+        let actual_ts = match presentation {
+            Some(presentation) => Timestamp::from(presentation.media_to_pts(timing.ts)),
+            None => match Timestamp::try_from(timing.ts) {
+                Ok(ts) => ts,
+                _ => return seek_error(SeekErrorKind::OutOfRange),
+            },
         };
 
         // Get the sample information.
@@ -652,12 +903,9 @@ impl FormatReader for IsoMp4Reader<'_> {
         let data =
             self.iter.read_raw_boxed_slice_exact(sample_info.pos, sample_info.len as usize)?;
 
-        Ok(Some(Packet::new(
-            next_sample_info.track_id,
-            next_sample_info.ts,
-            next_sample_info.dur,
-            data,
-        )))
+        let track = &self.track_states[next_sample_info.track_num];
+
+        Ok(Some(track.make_packet(next_sample_info.ts, next_sample_info.dur, data)))
     }
 
     fn metadata(&mut self) -> Metadata<'_> {

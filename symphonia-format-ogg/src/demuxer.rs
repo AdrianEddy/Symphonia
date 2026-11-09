@@ -227,6 +227,13 @@ impl<'s> OggReader<'s> {
                     // the in the page. Update the lower bound and bisect again.
                     start_byte_pos = mid_byte_pos;
                 }
+                else if self.pages.header().is_last_page {
+                    // The last page's packets include the end padding, so its start is not its end
+                    // less their duration. Update the upper bound and bisect again: the linear
+                    // search then reads the last page after the page before it, whose end is the
+                    // last page's start.
+                    end_byte_pos = mid_byte_pos;
+                }
                 else {
                     // The sample with the required timestamp is contained in the page. The
                     // bisection has converged on the correct page so stop the bisection.
@@ -268,7 +275,9 @@ impl<'s> OggReader<'s> {
                         continue;
                     }
 
-                    match packet.pts.checked_add(packet.dur) {
+                    // The packet's decoded frames, the trimmed ones included, end at its PTS plus
+                    // its block duration.
+                    match packet.pts.checked_add(packet.block_dur()) {
                         Some(next_packet_ts) if next_packet_ts < target_ts => (),
                         // Packet exceeds the requested timestamp, or the representable range.
                         _ => break packet.pts,

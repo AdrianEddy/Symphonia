@@ -87,6 +87,8 @@ pub struct FlacDecoder {
     is_validating: bool,
     validator: Validator,
     buf: AudioBuffer<i32>,
+    /// If true, the packets' encoder delay and padding are trimmed.
+    gapless: bool,
 }
 
 impl FlacDecoder {
@@ -132,6 +134,7 @@ impl FlacDecoder {
             is_validating: options.verify,
             validator: Default::default(),
             buf,
+            gapless: options.gapless,
         })
     }
 
@@ -239,6 +242,11 @@ impl FlacDecoder {
         if bits_per_sample < 32 {
             let shift = 32 - bits_per_sample;
             self.buf.apply(|sample| sample << shift);
+        }
+
+        // Trim gaps.
+        if self.gapless {
+            self.buf.trim(packet.trim_start.get() as usize, packet.trim_end.get() as usize);
         }
 
         Ok(())

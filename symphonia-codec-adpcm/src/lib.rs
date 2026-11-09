@@ -71,10 +71,12 @@ pub struct AdpcmDecoder {
     params: AudioCodecParameters,
     inner_decoder: InnerDecoder,
     buf: AudioBuffer<i32>,
+    /// If true, the packets' encoder delay and padding are trimmed.
+    gapless: bool,
 }
 
 impl AdpcmDecoder {
-    pub fn try_new(params: &AudioCodecParameters, _opts: &AudioDecoderOptions) -> Result<Self> {
+    pub fn try_new(params: &AudioCodecParameters, opts: &AudioDecoderOptions) -> Result<Self> {
         // This decoder only supports certain ADPCM codecs.
         if !is_supported_adpcm_codec(params.codec) {
             return unsupported_error("adpcm: invalid codec");
@@ -116,6 +118,7 @@ impl AdpcmDecoder {
             params: params.clone(),
             inner_decoder,
             buf: AudioBuffer::new(spec, frames),
+            gapless: opts.gapless,
         })
     }
 
@@ -162,6 +165,11 @@ impl AdpcmDecoder {
                 }
             }
             _ => unreachable!(),
+        }
+
+        // Trim gaps.
+        if self.gapless {
+            self.buf.trim(packet.trim_start.get() as usize, packet.trim_end.get() as usize);
         }
 
         Ok(())

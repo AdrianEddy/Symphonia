@@ -21,13 +21,16 @@ use symphonia_core::units::TimeBase;
 use log::{info, warn};
 
 use crate::codecs::make_track_codec_params;
-use crate::ebml::{EbmlElementInfo, EbmlError, EbmlIterator, EbmlSchema, ReadEbml};
+use crate::ebml::{
+    EbmlElementInfo, EbmlError, EbmlIterator, EbmlIteratorState, EbmlSchema, ReadEbml,
+};
 use crate::lacing::{Frame, extract_frames};
+use crate::opus::OpusTrim;
 use crate::schema::{MkvElement, MkvSchema};
 use crate::segment::{
     AttachmentsElement, BlockGroupElement, ChaptersElement, CuesElement, EbmlHeaderElement,
-    InfoElement, MatroskaTicks, NonZeroMatroskaTicks, SeekHeadElement, SegmentTicks,
-    SignedTrackTicks, TagsElement, TargetTagsMap, TracksElement,
+    InfoElement, NonZeroMatroskaTicks, SeekHeadElement, SegmentTicks, SignedTrackTicks,
+    TagsElement, TargetTagsMap, TrackTicks, TracksElement,
 };
 
 const MKV_FORMAT_INFO: FormatInfo =
@@ -38,12 +41,19 @@ pub struct TrackState {
     track_num: u32,
     /// The default frame duration.
     pub(crate) default_frame_duration: Option<NonZeroMatroskaTicks>,
-    /// The codec delay.
-    pub(crate) codec_delay: MatroskaTicks,
+    /// The codec delay, subtracted from the timestamp of each block: in track ticks, rounded to
+    /// the nearest tick, as FFmpeg's muxer adds it to the block timestamps and its demuxer
+    /// subtracts it.
+    pub(crate) codec_delay: TrackTicks,
     /// The track's timebase.
     pub(crate) track_time_base: TimeBase,
     /// The track's timestamp scale.
     pub(crate) track_timestamp_scale: f64,
+    /// The seek pre-roll: the duration of data the decoder must decode after a discontinuity
+    /// before its output is valid.
+    seek_pre_roll: TrackTicks,
+    /// For an Opus track, its gapless trimming state.
+    pub(crate) opus: Option<OpusTrim>,
 }
 
 /// Matroska (MKV) and WebM demultiplexer.
@@ -52,6 +62,10 @@ pub struct TrackState {
 pub struct MkvReader<'s> {
     /// Iterator over EBML element headers
     iter: EbmlIterator<MediaSourceStream<'s>, MkvSchema>,
+    /// The state of the iterator at the start of the Segment element's children.
+    segment_state: EbmlIteratorState<MkvSchema>,
+    /// The position of the first Cluster element, relative to the Segment element's data.
+    first_cluster_pos: u64,
     media_info: MediaInfo,
     tracks: Vec<Track>,
     track_states: HashMap<u32, TrackState>,
@@ -61,6 +75,11 @@ pub struct MkvReader<'s> {
     cues: Option<CuesElement>,
     current_cluster: Option<ClusterState>,
     frames: VecDeque<Frame>,
+    /// Every element from the start of the first cluster up to this position has been read.
+    read_to: u64,
+    /// Every element from the start of the first cluster up to the iterator's position has been
+    /// read, so the first frame of a track that is read is the track's first frame.
+    read_all_before: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -98,6 +117,8 @@ impl<'s> MkvReader<'s> {
 
         // Descend into the Segment element.
         it.push_element()?;
+
+        let segment_state = it.save_state();
 
         let mut segment_tracks = None;
         let mut info = None;
@@ -224,14 +245,17 @@ impl<'s> MkvReader<'s> {
         // If seekable, seek to the start of the first cluster, if known, or the start of the
         // segment. If unseekable, the element iterator is already positioned at the start of the
         // first cluster.
+        let first_cluster_pos = current_cluster.as_ref().map(|cluster| cluster.start).unwrap_or(0);
+
         if is_seekable {
-            let cluster_pos = current_cluster.as_ref().map(|cluster| cluster.start).unwrap_or(0);
-            it.seek_to_child(cluster_pos)?;
+            it.seek_to_child(first_cluster_pos)?;
             let _ = it.next_header()?;
         }
 
         // Descend into the cluster.
         it.push_element()?;
+
+        let read_to = it.pos();
 
         let info = info.ok_or(Error::DecodeError("mkv: missing Info element"))?;
 
@@ -286,15 +310,20 @@ impl<'s> MkvReader<'s> {
                 .scale(track.track_timestamp_scale)
                 .ok_or(Error::DecodeError("mkv: track timebase is invalid"))?;
 
-            // Create the track state.
+            let codec_delay = track.codec_delay.into_track_ticks_rounded(track_time_base);
+
+            // Create the track state. Opus tracks are trimmed by the reader (see `OpusTrim`).
             let state = TrackState {
                 // TODO: This should be 64-bit, but track IDs are 32-bit.
                 track_num: u32::try_from(track.number.get())
                     .map_err(|_| Error::Unsupported("mkv: track number too large (report this)"))?,
                 default_frame_duration: track.default_duration,
-                codec_delay: track.codec_delay,
+                codec_delay,
                 track_time_base,
                 track_timestamp_scale: track.track_timestamp_scale,
+                seek_pre_roll: track.seek_pre_roll.into_track_ticks_rounded_up(track_time_base),
+                opus: (track.codec_id == "A_OPUS")
+                    .then(|| OpusTrim::new(track.codec_delay, codec_delay, track_time_base)),
             };
 
             // Create the track.
@@ -330,6 +359,8 @@ impl<'s> MkvReader<'s> {
 
         Ok(Self {
             iter: it,
+            segment_state,
+            first_cluster_pos,
             media_info,
             tracks,
             track_states,
@@ -339,10 +370,19 @@ impl<'s> MkvReader<'s> {
             cues,
             current_cluster,
             frames: VecDeque::new(),
+            read_to,
+            read_all_before: true,
         })
     }
 
-    fn seek_track_by_ts_forward(&mut self, track_id: u32, ts: Timestamp) -> Result<SeekedTo> {
+    /// Skip frames until the frame of the track `track_id` that contains `ts`. `required_ts` is the
+    /// timestamp the seek was asked for, which `ts` precedes by the seek pre-roll.
+    fn seek_track_by_ts_forward(
+        &mut self,
+        track_id: u32,
+        ts: Timestamp,
+        required_ts: Timestamp,
+    ) -> Result<SeekedTo> {
         let actual_ts = 'out: loop {
             // Skip frames from the buffer until the given timestamp
             while let Some(frame) = self.frames.front() {
@@ -366,7 +406,7 @@ impl<'s> MkvReader<'s> {
             }
         };
 
-        Ok(SeekedTo { track_id, required_ts: ts, actual_ts })
+        Ok(SeekedTo { track_id, required_ts, actual_ts })
     }
 
     fn seek_track_by_ts_atomic(
@@ -378,20 +418,49 @@ impl<'s> MkvReader<'s> {
         // Save the iterator and cluster states to restore in-case of and error.
         let iter_state = self.iter.save_state();
         let cluster_state = self.current_cluster;
+        let read_all_before = self.read_all_before;
+
+        // A seek by the cues moves the reader, so the frames still queued from the block read last
+        // do not follow where it lands. Set them aside, to restore if the seek fails. A seek without
+        // cues reads on from them.
+        let queued = self.cues.is_some().then(|| std::mem::take(&mut self.frames));
 
         match self.seek_track_by_ts(id, tb, ts) {
             Err(err) => {
-                // Restore saved iterator and cluster states.
+                // Restore saved iterator and cluster states, and the frames set aside.
                 self.iter.restore_state(iter_state)?;
                 self.current_cluster = cluster_state;
+                self.read_all_before = read_all_before;
+                if let Some(queued) = queued {
+                    self.frames = queued;
+                }
                 Err(err)
             }
-            value => value,
+            value => {
+                // The reader moved, so the frames read next are not those that followed the frames
+                // read before.
+                for state in self.track_states.values_mut() {
+                    if let Some(opus) = &mut state.opus {
+                        opus.relocate();
+                    }
+                }
+                value
+            }
         }
     }
 
-    fn seek_track_by_ts(&mut self, id: u32, tb: TimeBase, ts: Timestamp) -> Result<SeekedTo> {
-        log::debug!("seeking track_id={id} to ts={ts}");
+    fn seek_track_by_ts(
+        &mut self,
+        id: u32,
+        tb: TimeBase,
+        required_ts: Timestamp,
+    ) -> Result<SeekedTo> {
+        log::debug!("seeking track_id={id} to ts={required_ts}");
+
+        // Decoding begins the seek pre-roll before the required timestamp, so that the decoded
+        // data is valid from the required timestamp on.
+        let pre_roll = self.track_states.get(&id).map(|state| state.seek_pre_roll);
+        let ts = required_ts.saturating_sub(pre_roll.unwrap_or_default().into_dur());
 
         // If cues exist, seek to the nearest cue point.
         if let Some(cues) = &self.cues {
@@ -399,9 +468,13 @@ impl<'s> MkvReader<'s> {
 
             // Cue points store timestamps in Matroska ticks while the timestamp being seeked to is
             // in signed Track ticks. Convert to unsigned Matroska ticks for iterating the cue
-            // points. If the timestamp is negative, then this is an error because cue points only
-            // contain unsigned Matroska ticks.
-            let ts = SignedTrackTicks::from(ts)
+            // points. If the required timestamp is negative, then this is an error because cue
+            // points only contain unsigned Matroska ticks.
+            if required_ts.is_negative() {
+                return seek_error(SeekErrorKind::OutOfRange);
+            }
+
+            let ts = SignedTrackTicks::from(ts.max(Timestamp::ZERO))
                 .try_into_matroska_ticks(tb)
                 .ok_or(Error::SeekError(SeekErrorKind::OutOfRange))?;
 
@@ -412,21 +485,46 @@ impl<'s> MkvReader<'s> {
                 target_cue_point = Some(cue_point);
             }
 
-            let target_cue_point =
-                target_cue_point.ok_or(Error::SeekError(SeekErrorKind::OutOfRange))?;
+            // Read from the cluster of the cue point. If the timestamp precedes every cue point,
+            // read from the first cluster: the cue points may index another track, so the track's
+            // blocks may begin before the first of them.
+            let (cluster_pos, cluster_ts, cluster_rel_pos) = match target_cue_point {
+                Some(cue_point) => {
+                    log::debug!(
+                        "found cue point: track_id={}, ts={}, seg_pos={}",
+                        cue_point.positions.track.get(),
+                        cue_point.time,
+                        cue_point.positions.cluster_pos
+                    );
 
-            log::debug!(
-                "found cue point: track_id={}, ts={}, seg_pos={}",
-                target_cue_point.positions.track.get(),
-                target_cue_point.time,
-                target_cue_point.positions.cluster_pos
-            );
+                    // Convert the cue point's timestamp (Matroska ticks) into Segment ticks for
+                    // the cluster state.
+                    let timestamp = cue_point.time.into_segment_ticks(
+                        self.media_info.time_base.expect("media info time base always populated"),
+                    );
 
-            // Ascend back to the segment element.
-            self.iter.pop_elements_upto(MkvElement::Segment)?;
+                    let positions = &cue_point.positions;
+                    (positions.cluster_pos, Some(timestamp), positions.cluster_rel_pos)
+                }
+                None => {
+                    log::debug!("no cue point at or before ts={ts}, reading the first cluster");
+
+                    // The cluster timestamp is read from the cluster's Timestamp element.
+                    (self.first_cluster_pos, None, None)
+                }
+            };
+
+            // Ascend back to the segment element. If the end of the segment was reached, the
+            // iterator has left the segment element, so return into it.
+            match self.iter.pop_elements_upto(MkvElement::Segment) {
+                Err(EbmlError::NotAnAncestor) => {
+                    self.iter.restore_state(self.segment_state.clone())?;
+                }
+                result => result?,
+            }
 
             // Seek to the specific cluster element.
-            self.iter.seek_to_child(target_cue_point.positions.cluster_pos)?;
+            self.iter.seek_to_child(cluster_pos)?;
 
             // Resume iteration.
             let cluster = match self.iter.next_header()? {
@@ -437,28 +535,39 @@ impl<'s> MkvReader<'s> {
                 _ => return seek_error(SeekErrorKind::Unseekable),
             };
 
-            // Convert the cue point's timestamp (Matroska ticks) into Segment ticks for the cluster
-            // state.
-            let timestamp = target_cue_point.time.into_segment_ticks(
-                self.media_info.time_base.expect("media info time base always populated"),
-            );
+            // Whether every element before the cluster has been read.
+            let read_before = cluster.pos() <= self.read_to;
 
             // Update the current cluster metadata.
             self.current_cluster =
-                Some(ClusterState { timestamp: Some(timestamp), start: cluster.pos() });
+                Some(ClusterState { timestamp: cluster_ts, start: cluster.pos() });
 
             // Descend into the cluster element.
             self.iter.push_element()?;
 
-            // If a cluster relative position is available, seek to the exact simple block or
-            // block group element.
-            if let Some(cluster_rel_pos) = target_cue_point.positions.cluster_rel_pos {
-                self.iter.seek_to_child(cluster_rel_pos)?;
-            }
+            // While the first frame of an Opus track has not been read, a cluster before which every
+            // element has been read is read from its start, not from the cue point's block: the
+            // track's first frame may precede that block, and a frame is known to be the track's
+            // first only if every element before it has been read.
+            let from_start = read_before
+                && self
+                    .track_states
+                    .values()
+                    .any(|state| state.opus.as_ref().is_some_and(|opus| !opus.knows_start()));
+
+            // Otherwise, if a cluster relative position is available, seek to the exact simple
+            // block or block group element.
+            self.read_all_before = match cluster_rel_pos {
+                Some(cluster_rel_pos) if !from_start => {
+                    self.iter.seek_to_child(cluster_rel_pos)?;
+                    self.iter.pos() <= self.read_to
+                }
+                _ => read_before,
+            };
         }
 
         // Seek to exact block.
-        self.seek_track_by_ts_forward(id, ts)
+        self.seek_track_by_ts_forward(id, ts, required_ts)
     }
 
     fn next_element(&mut self) -> Result<bool> {
@@ -516,26 +625,40 @@ impl<'s> MkvReader<'s> {
                             return Ok(true);
                         };
 
-                        // Get block data and duration.
-                        let (data, duration) = match block_type {
-                            MkvElement::SimpleBlock => (self.iter.read_binary()?, None),
+                        // Get block data, duration, and discard padding.
+                        let (data, duration, discard_padding) = match block_type {
+                            MkvElement::SimpleBlock => (self.iter.read_binary()?, None, None),
                             MkvElement::BlockGroup => {
                                 let group = self.iter.read_master_element::<BlockGroupElement>()?;
-                                (group.data, group.duration)
+                                (group.data, group.duration, group.discard_padding)
                             }
                             _ => unreachable!(),
                         };
+
+                        let first_frame = self.frames.len();
 
                         // Extract frames.
                         if !extract_frames(
                             &data,
                             duration,
+                            discard_padding,
                             cluster_ts,
                             &self.track_states,
                             &mut self.frames,
                         )? {
                             warn!("pts for block is too large");
                             return Ok(false);
+                        }
+
+                        // Learn where an Opus track starts: while every block before this one has
+                        // been read, the first block of a track that is read is its first block.
+                        if self.read_all_before {
+                            if let Some(frame) = self.frames.get(first_frame) {
+                                let state = self.track_states.get_mut(&frame.track_num);
+                                if let Some(opus) = state.and_then(|state| state.opus.as_mut()) {
+                                    opus.observe(frame.pts.into_ts().get());
+                                }
+                            }
                         }
                     }
                     // All other elements.
@@ -544,6 +667,11 @@ impl<'s> MkvReader<'s> {
                     }
                 }
             }
+        }
+
+        // The element has been read.
+        if self.read_all_before {
+            self.read_to = self.read_to.max(self.iter.pos());
         }
 
         Ok(true)
@@ -634,12 +762,21 @@ impl FormatReader for MkvReader<'_> {
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             if let Some(frame) = self.frames.pop_front() {
-                return Ok(Some(Packet::new(
+                let mut packet = Packet::new(
                     frame.track_num,
                     frame.pts.into_ts(),
                     frame.dur.into_dur(),
                     frame.data,
-                )));
+                );
+
+                // Trim the encoder delay and padding of an Opus track.
+                if let Some(opus) =
+                    self.track_states.get_mut(&frame.track_num).and_then(|s| s.opus.as_mut())
+                {
+                    opus.trim(&mut packet, frame.opus);
+                }
+
+                return Ok(Some(packet));
             }
 
             if !self.next_element()? {

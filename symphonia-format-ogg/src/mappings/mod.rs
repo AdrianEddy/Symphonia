@@ -51,6 +51,11 @@ pub trait Mapper: Send + Sync {
     /// Soft-reset the mapper after a discontinuity in packets.
     fn reset(&mut self);
 
+    /// Called after a discontinuity in packets, when the packets that follow are the first
+    /// packets of the stream again (e.g., after seeking to the start of the stream). State that
+    /// only applies at the start of the stream, such as encoder delay to discard, applies again.
+    fn rewind(&mut self) {}
+
     /// Gets an immutable reference to the `Track` for the stream belonging to this `Mapper`. If
     /// the stream is not ready then the track may be incomplete.
     fn track(&self) -> &Track;

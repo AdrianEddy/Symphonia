@@ -9,7 +9,7 @@ use crate::common::SideData;
 
 use super::{MapResult, Mapper, PacketParser};
 
-use symphonia_common::xiph::audio::opus;
+use symphonia_common::xiph::audio::opus::{self, OPUS_SAMPLE_RATE};
 use symphonia_core::codecs::CodecParameters;
 use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::codecs::audio::well_known::CODEC_ID_OPUS;
@@ -18,7 +18,7 @@ use symphonia_core::formats::Track;
 use symphonia_core::io::{BufReader, ReadBytes};
 use symphonia_core::meta::MetadataBuilder;
 
-use symphonia_core::units::Duration;
+use symphonia_core::units::{Duration, Timestamp};
 use symphonia_metadata::embedded::vorbis::{self, VORBIS_COMMENT_METADATA_INFO};
 
 use log::warn;
@@ -26,31 +26,39 @@ use log::warn;
 /// The minimum expected size of an Opus identification packet.
 const OGG_OPUS_MIN_IDENTIFICATION_PACKET_SIZE: usize = 19;
 
+/// The signature for an Opus identification packet.
+const OGG_OPUS_HEAD_SIGNATURE: &[u8] = b"OpusHead";
+
 /// The signature for an Opus metadata packet.
 const OGG_OPUS_COMMENT_SIGNATURE: &[u8] = b"OpusTags";
 
 /// The maximum support Opus OGG mapping version.
 const OGG_OPUS_MAPPING_VERSION_MAX: u8 = 0x0f;
 
+/// The amount of audio to decode before the seek target to let the decoder converge, 80 ms
+/// (RFC 7845, §4.6), in frames at 48 kHz.
+const OGG_OPUS_SEEK_PRE_ROLL: u64 = 80 * OPUS_SAMPLE_RATE as u64 / 1000;
+
 pub fn detect(serial: u32, buf: &[u8]) -> Result<Option<Box<dyn Mapper>>> {
-    // The identification packet for Opus must be a minimum size.
-    if buf.len() < OGG_OPUS_MIN_IDENTIFICATION_PACKET_SIZE {
+    // The identification packet for Opus must be a minimum size, and start with the signature.
+    if buf.len() < OGG_OPUS_MIN_IDENTIFICATION_PACKET_SIZE
+        || !buf.starts_with(OGG_OPUS_HEAD_SIGNATURE)
+    {
         return Ok(None);
     }
 
     let mut reader = BufReader::new(buf);
 
-    let Ok(opus_head) = opus::OpusHead::read(&mut reader, OGG_OPUS_MAPPING_VERSION_MAX)
-    else {
-        return Ok(None);
-    };
+    // The stream is an Opus stream. If its identification header is malformed, refuse it by
+    // name.
+    let opus_head = opus::OpusHead::read(&mut reader, OGG_OPUS_MAPPING_VERSION_MAX)?;
 
     // Populate the codec parameters with the information read from identification header.
     let mut codec_params = AudioCodecParameters::new();
 
     codec_params
         .for_codec(CODEC_ID_OPUS)
-        .with_sample_rate(48_000)
+        .with_sample_rate(OPUS_SAMPLE_RATE)
         .with_channels(opus_head.channels)
         .with_extra_data(Box::from(buf));
 
@@ -62,77 +70,53 @@ pub fn detect(serial: u32, buf: &[u8]) -> Result<Option<Box<dyn Mapper>>> {
         .with_delay(u32::from(opus_head.pre_skip));
 
     // Instantiate the Opus mapper.
-    let mapper = Box::new(OpusMapper { track, need_comment: true });
+    let pre_skip = u64::from(opus_head.pre_skip);
+
+    let mapper = Box::new(OpusMapper {
+        track,
+        need_comment: true,
+        pre_skip,
+        parser: OpusPacketParser { pre_skip },
+    });
 
     Ok(Some(mapper))
 }
 
-pub struct OpusPacketParser {}
+/// Parses the duration of Opus packets, and the frames of the pre-skip they carry.
+///
+/// The decoder's first `pre_skip` frames are the encoder's delay, which must be discarded
+/// (RFC 7845, §4.2). A parser is created at the start of the stream, so it reports the pre-skip as
+/// the frames to discard from the first packets it parses.
+pub struct OpusPacketParser {
+    /// The frames of the pre-skip still to be discarded.
+    pre_skip: u64,
+}
 
 impl PacketParser for OpusPacketParser {
     fn parse_next_packet_dur(&mut self, packet: &[u8]) -> (Duration, Duration) {
-        // See https://www.rfc-editor.org/rfc/rfc6716
-        // Read TOC (Table Of Contents) byte which is the first byte in the opus data.
-        let toc_byte = match packet.first() {
-            Some(b) => b,
-            None => {
-                warn!("opus packet empty");
-                return (Duration::ZERO, Duration::ZERO);
-            }
+        // The duration is read from the packet's TOC byte (RFC 6716, §3.1).
+        let Some(frames) = opus::packet_frames(packet)
+        else {
+            warn!("ogg (opus): malformed packet");
+            return (Duration::ZERO, Duration::ZERO);
         };
-        // The configuration number is the 5 most significant bits. Shift out 3 least significant
-        // bits.
-        let configuration_number = toc_byte >> 3; // max 2^5-1 = 31
 
-        // The configuration number maps to packet length according to this lookup table.
-        // See https://www.rfc-editor.org/rfc/rfc6716 top half of page 14.
-        // Numbers are in milliseconds in the rfc. Down below they are in TimeBase units, so
-        // 10ms = 10*48.
-        #[rustfmt::skip]
-        const CONFIGURATION_NUMBER_TO_FRAME_DURATION: [u32; 32] = [
-            10*48, 20*48, 40*48, 60*48,
-            10*48, 20*48, 40*48, 60*48,
-            10*48, 20*48, 40*48, 60*48,
-            10*48, 20*48,
-            10*48, 20*48,
-            (2.5*48.0) as u32, 5*48, 10*48, 20*48,
-            (2.5*48.0) as u32, 5*48, 10*48, 20*48,
-            (2.5*48.0) as u32, 5*48, 10*48, 20*48,
-            (2.5*48.0) as u32, 5*48, 10*48, 20*48,
-        ];
-        // Look up the frame length.
-        let frame_duration =
-            CONFIGURATION_NUMBER_TO_FRAME_DURATION[configuration_number as usize] as u64;
+        let dur = u64::from(frames);
+        let discard = self.pre_skip.min(dur);
 
-        // Look up the number of frames in the packet.
-        // See https://www.rfc-editor.org/rfc/rfc6716 bottom half of page 14.
-        let c = toc_byte & 0b11; // Note: it's actually called "c" in the rfc.
-        let num_frames = match c {
-            0 => 1,
-            1 | 2 => 2,
-            3 => match packet.get(1) {
-                Some(byte) => {
-                    // TOC byte is followed by number of frames. See page 18 section 3.2.5 code 3
-                    let m = byte & 0b11111; // Note: it's actually called "M" in the rfc.
-                    m as u64
-                }
-                None => {
-                    // What to do here? I'd like to return an error but this is an infalliable
-                    // trait.
-                    warn!("opus code 3 packet with no following byte containing number of frames");
-                    return (Duration::ZERO, Duration::ZERO);
-                }
-            },
-            _ => unreachable!("masked 2 bits"),
-        };
-        // Look up the packet length and return it.
-        (Duration::new(frame_duration * num_frames), Duration::ZERO)
+        self.pre_skip -= discard;
+
+        (Duration::new(dur), Duration::new(discard))
     }
 }
 
 struct OpusMapper {
     track: Track,
     need_comment: bool,
+    /// The pre-skip, in frames at 48 kHz.
+    pre_skip: u64,
+    /// The packet parser of the stream's packets.
+    parser: OpusPacketParser,
 }
 
 impl Mapper for OpusMapper {
@@ -141,7 +125,17 @@ impl Mapper for OpusMapper {
     }
 
     fn reset(&mut self) {
-        // Nothing to do.
+        // After a discontinuity the packets are not the first packets of the stream, unless the
+        // stream is rewound (see `rewind`), so the parser has no pre-skip left to discard. Where a
+        // pre-skip outlasts the stream's first page, the logical stream trims the rest of it by
+        // timestamp (the frames before the track's start).
+        self.parser.pre_skip = 0;
+    }
+
+    fn rewind(&mut self) {
+        // The packets are the first packets of the stream again, so the pre-skip is discarded
+        // again.
+        self.parser.pre_skip = self.pre_skip;
     }
 
     fn track(&self) -> &Track {
@@ -152,13 +146,25 @@ impl Mapper for OpusMapper {
         &mut self.track
     }
 
+    fn absgp_to_ts(&self, absgp: u64) -> Timestamp {
+        // The PCM sample position of a granule position is the granule position less the pre-skip
+        // (RFC 7845, §4.3).
+        Timestamp::from(absgp as i64).saturating_sub(Duration::new(self.pre_skip))
+    }
+
+    fn max_rap_period(&self) -> Duration {
+        // A decoder resuming from any packet converges within 80 ms, so decoding SHOULD begin at
+        // least 80 ms before the seek target (RFC 7845, §4.6).
+        Duration::new(OGG_OPUS_SEEK_PRE_ROLL)
+    }
+
     fn make_parser(&self) -> Option<Box<dyn super::PacketParser>> {
-        Some(Box::new(OpusPacketParser {}))
+        Some(Box::new(OpusPacketParser { pre_skip: self.pre_skip }))
     }
 
     fn map_packet(&mut self, packet: &[u8]) -> Result<MapResult> {
         if !self.need_comment {
-            let (dur, discard) = OpusPacketParser {}.parse_next_packet_dur(packet);
+            let (dur, discard) = self.parser.parse_next_packet_dur(packet);
             Ok(MapResult::StreamData { dur, discard })
         }
         else {

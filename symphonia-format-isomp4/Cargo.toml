@@ -19,5 +19,8 @@ symphonia-core = { version = "0.6.1", path = "../symphonia-core" }
 symphonia-common = { version = "0.6.1", path = "../symphonia-common" }
 symphonia-metadata = { version = "0.6.1", path = "../symphonia-metadata", default-features = false }
 
+[dev-dependencies]
+symphonia-codec-aac = { version = "0.6.1", path = "../symphonia-codec-aac" }
+
 [lints]
 workspace = true

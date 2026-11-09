@@ -214,10 +214,12 @@ pub struct PcmDecoder {
     /// The number of bytes per coded frame.
     bytes_per_coded_frame: usize,
     buf: GenericAudioBuffer,
+    /// If true, the packets' encoder delay and padding are trimmed.
+    gapless: bool,
 }
 
 impl PcmDecoder {
-    pub fn try_new(params: &AudioCodecParameters, _opts: &AudioDecoderOptions) -> Result<Self> {
+    pub fn try_new(params: &AudioCodecParameters, opts: &AudioDecoderOptions) -> Result<Self> {
         // This decoder only supports certain PCM codecs.
         if !is_supported_pcm_codec(params.codec) {
             return unsupported_error("pcm: invalid codec");
@@ -312,7 +314,13 @@ impl PcmDecoder {
         // Create an audio buffer of the correct sample format.
         let buf = GenericAudioBuffer::new(sample_format, spec, capacity);
 
-        Ok(PcmDecoder { params: params.clone(), shift, bytes_per_coded_frame, buf })
+        Ok(PcmDecoder {
+            params: params.clone(),
+            shift,
+            bytes_per_coded_frame,
+            buf,
+            gapless: opts.gapless,
+        })
     }
 
     fn decode_inner(&mut self, packet: &PacketRef<'_>) -> Result<()> {
@@ -406,6 +414,11 @@ impl PcmDecoder {
             // CODEC_ID_PCM_F64BE_PLANAR =>
             _ => unsupported_error("pcm: codec is unsupported"),
         };
+
+        // Trim gaps.
+        if self.gapless {
+            self.buf.trim(packet.trim_start.get() as usize, packet.trim_end.get() as usize);
+        }
 
         Ok(())
     }

@@ -12,7 +12,10 @@ use symphonia_core::io::{BufReader, ReadBytes};
 
 use crate::demuxer::TrackState;
 use crate::ebml::{read_signed_vint, read_unsigned_vint};
-use crate::segment::{MatroskaTicks, SegmentTicks, SignedTrackTicks, TrackTicks};
+use crate::opus::{self, OpusBlockDurations, OpusFrame};
+use crate::segment::{
+    MatroskaTicks, SegmentTicks, SignedMatroskaTicks, SignedTrackTicks, TrackTicks,
+};
 
 enum Lacing {
     None,
@@ -81,6 +84,10 @@ pub(crate) struct Frame {
     pub(crate) dur: TrackTicks,
     /// Frame data.
     pub(crate) data: Box<[u8]>,
+    /// For a frame of an Opus track, its length read from its TOC and its share of its block's
+    /// `DiscardPadding`. `None` for another codec, or if the frame is not a well-formed Opus
+    /// packet.
+    pub(crate) opus: Option<OpusFrame>,
 }
 
 /// Calculate the PTS of a block. This is the PTS of the first frame in the block.
@@ -92,11 +99,8 @@ fn calculate_block_pts(
     // Convert the cluster timestamp into Track ticks from Segment ticks.
     let cluster_ts = cluster_ts.into_track_ticks(track.track_timestamp_scale).try_into_signed()?;
 
-    cluster_ts.checked_add(block_rel_ts).and_then(|ts| {
-        // Codec delay must be converted into Track ticks from Matroska ticks.
-        let codec_delay = track.codec_delay.into_track_ticks(track.track_time_base);
-        ts.checked_sub_unsigned(codec_delay)
-    })
+    // The codec delay is stored in Track ticks.
+    cluster_ts.checked_add(block_rel_ts).and_then(|ts| ts.checked_sub_unsigned(track.codec_delay))
 }
 
 /// Iterator-like utility to precisely compute the duration of frames in a block.
@@ -136,9 +140,37 @@ impl FrameDurationIter {
     }
 }
 
+/// Iterator-like utility to compute the duration of each frame in a block, from the frame itself
+/// if the codec states it there, otherwise from the block.
+struct FrameDurations {
+    /// The durations derived from the block's duration.
+    block: FrameDurationIter,
+    /// For an Opus track, the durations read from each frame's TOC.
+    opus: Option<OpusBlockDurations>,
+}
+
+impl FrameDurations {
+    fn new(block_dur: Option<TrackTicks>, track: &TrackState, num_frames: u64) -> Self {
+        FrameDurations {
+            block: FrameDurationIter::new(block_dur, track, num_frames),
+            opus: track.opus.as_ref().map(|_| OpusBlockDurations::new(track.track_time_base)),
+        }
+    }
+
+    /// The duration of the next frame of the block, and the frame if it is an Opus frame.
+    fn next(&mut self, data: &[u8]) -> (TrackTicks, Option<OpusFrame>) {
+        let block_dur = self.block.next();
+        match self.opus.as_mut().and_then(|opus| opus.next(data)) {
+            Some((dur, frame)) => (dur, Some(frame)),
+            None => (block_dur, None),
+        }
+    }
+}
+
 pub(crate) fn extract_frames(
     block: &[u8],
     block_duration: Option<TrackTicks>,
+    discard_padding: Option<SignedMatroskaTicks>,
     cluster_ts: SegmentTicks,
     tracks: &HashMap<u32, TrackState>,
     frames: &mut VecDeque<Frame>,
@@ -158,11 +190,14 @@ pub(crate) fn extract_frames(
         _ => return Ok(false),
     };
 
+    // The index of the block's first frame in the frame queue.
+    let first_frame = frames.len();
+
     match lacing {
         Lacing::None => {
             let data = reader.read_boxed_slice_exact(block.len() - reader.pos() as usize)?;
-            let dur = FrameDurationIter::new(block_duration, track, 1).next();
-            frames.push_back(Frame { track_num, pts, data, dur });
+            let (dur, opus) = FrameDurations::new(block_duration, track, 1).next(&data);
+            frames.push_back(Frame { track_num, pts, data, dur, opus });
         }
         Lacing::Xiph | Lacing::Ebml => {
             // Read number of stored sizes which is actually `number of frames` - 1
@@ -183,13 +218,13 @@ pub(crate) fn extract_frames(
                 _ => return decode_error("mkv: total of laced frame sizes exceeds block"),
             }
 
-            let mut dur_it = FrameDurationIter::new(block_duration, track, num_frames as u64 + 1);
+            let mut dur_it = FrameDurations::new(block_duration, track, num_frames as u64 + 1);
 
             for frame_size in sizes {
                 let data = reader.read_boxed_slice_exact(frame_size as usize)?;
-                let dur = dur_it.next();
+                let (dur, opus) = dur_it.next(&data);
 
-                frames.push_back(Frame { track_num, pts, data, dur });
+                frames.push_back(Frame { track_num, pts, data, dur, opus });
 
                 // If PTS overflows, end the stream.
                 pts = match pts.checked_add_unsigned(dur) {
@@ -201,7 +236,8 @@ pub(crate) fn extract_frames(
             // Size of last frame is not provided so we read to the end of the block.
             let size = block.len() - reader.pos() as usize;
             let data = reader.read_boxed_slice_exact(size)?;
-            frames.push_back(Frame { track_num, pts, data, dur: dur_it.next() });
+            let (dur, opus) = dur_it.next(&data);
+            frames.push_back(Frame { track_num, pts, data, dur, opus });
         }
         Lacing::FixedSize => {
             let num_frames = reader.read_byte()? as usize + 1;
@@ -210,14 +246,14 @@ pub(crate) fn extract_frames(
                 return decode_error("mkv: invalid block size");
             }
 
-            let mut dur_it = FrameDurationIter::new(block_duration, track, num_frames as u64);
+            let mut dur_it = FrameDurations::new(block_duration, track, num_frames as u64);
 
             let frame_size = total_size / num_frames;
             for _ in 0..num_frames {
                 let data = reader.read_boxed_slice_exact(frame_size)?;
-                let dur = dur_it.next();
+                let (dur, opus) = dur_it.next(&data);
 
-                frames.push_back(Frame { track_num, pts, data, dur });
+                frames.push_back(Frame { track_num, pts, data, dur, opus });
 
                 // If PTS overflows, end the stream.
                 pts = match pts.checked_add_unsigned(dur) {
@@ -226,6 +262,13 @@ pub(crate) fn extract_frames(
                 };
             }
         }
+    }
+
+    // The discard padding is at the end of the block if positive, or at its start if negative, and
+    // may span several of its frames.
+    if let Some(discard_padding) = discard_padding {
+        let block = frames.range_mut(first_frame..).filter_map(|frame| frame.opus.as_mut());
+        opus::discard_padding(block, discard_padding);
     }
 
     Ok(true)

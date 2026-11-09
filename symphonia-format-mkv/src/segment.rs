@@ -135,6 +135,23 @@ impl MatroskaTicks {
             / u64::from(track_time_base.denom.get());
         TrackTicks(self.0 / factor)
     }
+
+    /// Convert `self` into Track ticks using the track timebase, rounding up to a whole tick.
+    #[inline]
+    pub fn into_track_ticks_rounded_up(self, track_time_base: TimeBase) -> TrackTicks {
+        let factor = (1_000_000_000 * u64::from(track_time_base.numer.get()))
+            / u64::from(track_time_base.denom.get());
+        TrackTicks(self.0.div_ceil(factor))
+    }
+
+    /// Convert `self` into Track ticks using the track timebase, rounding to the nearest tick
+    /// (halves away from zero).
+    #[inline]
+    pub fn into_track_ticks_rounded(self, track_time_base: TimeBase) -> TrackTicks {
+        let factor = (1_000_000_000 * u64::from(track_time_base.numer.get()))
+            / u64::from(track_time_base.denom.get());
+        TrackTicks(self.0 / factor + u64::from(self.0 % factor >= factor - factor / 2))
+    }
 }
 
 impl From<u64> for MatroskaTicks {
@@ -176,6 +193,14 @@ impl From<NonZeroU64> for NonZeroMatroskaTicks {
 /// Matroska ticks are timestamps or durations stored in nanoseconds.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SignedMatroskaTicks(i64);
+
+impl SignedMatroskaTicks {
+    /// Get the underlying value.
+    #[inline]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
 
 impl From<i64> for SignedMatroskaTicks {
     #[inline]
