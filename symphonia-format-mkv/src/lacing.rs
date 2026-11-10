@@ -91,7 +91,7 @@ pub(crate) struct Frame {
 }
 
 /// Calculate the PTS of a block. This is the PTS of the first frame in the block.
-fn calculate_block_pts(
+pub(crate) fn calculate_block_pts(
     cluster_ts: SegmentTicks,
     block_rel_ts: SignedTrackTicks,
     track: &TrackState,

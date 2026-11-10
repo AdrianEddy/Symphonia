@@ -106,12 +106,17 @@ pub fn probe_stream_end(
 
     // Optimization: Try a linear scan of the last few pages first. This will cover all
     // non-chained physical streams, which is the majority of cases.
-    if byte_range_end >= linear_scan_len && byte_range_start <= byte_range_end - linear_scan_len {
-        reader.seek(SeekFrom::Start(byte_range_end - linear_scan_len))?;
+    let mut scan_start = if byte_range_end >= linear_scan_len
+        && byte_range_start <= byte_range_end - linear_scan_len
+    {
+        byte_range_end - linear_scan_len
     }
     else {
-        reader.seek(SeekFrom::Start(byte_range_start))?;
-    }
+        byte_range_start
+    };
+    let mut scan_end = byte_range_end;
+
+    reader.seek(SeekFrom::Start(scan_start))?;
 
     pages.next_page(reader)?;
 
@@ -150,15 +155,43 @@ pub fn probe_stream_end(
         }
 
         // Scan the last few pages of the physical stream.
-        reader.seek(SeekFrom::Start(start))?;
+        (scan_start, scan_end) = (start, end);
+
+        reader.seek(SeekFrom::Start(scan_start))?;
 
         pages.next_page(reader)?;
 
-        scan_stream_end(reader, pages, streams, end)
+        // The physical stream's last page begins before `end`, where the bisection stopped, but may
+        // end after it: the scan reads on to the first page of the next physical stream.
+        scan_stream_end(reader, pages, streams, byte_range_end)
     }
     else {
         result
     };
+
+    // The end padding of a stream is read from its last page and the page before it (and the
+    // pages a packet continued onto the last page began on, and the packet before them), which the
+    // scan may have begun after. Scan the end of the physical stream again from earlier, the length
+    // scanned doubled each time, until every stream whose last page was read has the pages its
+    // padding is read from or found one of them lost, or the scan begins with the physical stream.
+    // A stream whose last page lies before the first scan is not looked for: it states no length.
+    while scan_start > byte_range_start
+        && streams.values().any(LogicalStream::end_needs_earlier_pages)
+    {
+        scan_start = scan_start.saturating_sub(scan_end - scan_start).max(byte_range_start);
+
+        debug!("scanning the end of the physical stream again, from {scan_start}");
+
+        for stream in streams.values_mut().filter(|stream| stream.end_needs_earlier_pages()) {
+            stream.forget_end();
+        }
+
+        reader.seek(SeekFrom::Start(scan_start))?;
+
+        pages.next_page(reader)?;
+
+        scan_stream_end(reader, pages, streams, byte_range_end);
+    }
 
     // Restore the original page
     reader.seek(SeekFrom::Start(byte_range_start))?;

@@ -14,6 +14,8 @@
 //! laced block, for its `DiscardPadding` and its frames' durations, are built in the test
 //! (`laced_block`).
 
+mod common;
+
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
@@ -25,6 +27,8 @@ use symphonia_core::io::MediaSourceStream;
 use symphonia_core::packet::Packet;
 use symphonia_core::units::{Time, Timestamp};
 use symphonia_format_mkv::MkvReader;
+
+use common::within_deadline;
 
 const FIXTURES: [&str; 3] = ["opus_stereo.mka", "opus_51.mka", "opus_laced.mka"];
 
@@ -167,222 +171,242 @@ fn the_duration_of_a_packet_is_read_from_its_toc() {
 
 #[test]
 fn a_seek_to_the_start_trims_the_codec_delay_again() {
-    for name in FIXTURES {
-        let mut reader = open(name);
-        assert_eq!(presented(&packets(&mut reader)), 48_000, "{name}");
+    within_deadline(|| {
+        for name in FIXTURES {
+            let mut reader = open(name);
+            assert_eq!(presented(&packets(&mut reader)), 48_000, "{name}");
 
-        let to = SeekTo::Time { time: Time::ZERO, track_id: None };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-        assert_eq!(seeked.required_ts, Timestamp::new(0), "{name}");
-        assert_eq!(seeked.actual_ts, Timestamp::new(-7), "{name}");
+            let to = SeekTo::Time { time: Time::ZERO, track_id: None };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+            assert_eq!(seeked.required_ts, Timestamp::new(0), "{name}");
+            assert_eq!(seeked.actual_ts, Timestamp::new(-7), "{name}");
 
-        let packets = packets(&mut reader);
-        assert_eq!(packets[0].trim_start.get(), 312, "{name}");
-        assert_eq!(presented(&packets), 48_000, "{name}");
-    }
+            let packets = packets(&mut reader);
+            assert_eq!(packets[0].trim_start.get(), 312, "{name}");
+            assert_eq!(presented(&packets), 48_000, "{name}");
+        }
+    });
 }
 
 #[test]
 fn a_seek_before_reading_trims_the_codec_delay_at_the_start() {
-    let mut reader = open("opus_stereo.mka");
+    within_deadline(|| {
+        let mut reader = open("opus_stereo.mka");
 
-    let to = SeekTo::Time { time: Time::ZERO, track_id: None };
-    reader.seek(SeekMode::Accurate, to).unwrap();
+        let to = SeekTo::Time { time: Time::ZERO, track_id: None };
+        reader.seek(SeekMode::Accurate, to).unwrap();
 
-    let packets = packets(&mut reader);
-    assert_eq!(packets[0].trim_start.get(), 312);
-    assert_eq!(presented(&packets), 48_000);
+        let packets = packets(&mut reader);
+        assert_eq!(packets[0].trim_start.get(), 312);
+        assert_eq!(presented(&packets), 48_000);
+    });
 }
 
 #[test]
 fn a_seek_into_the_track_takes_the_pre_roll_and_trims_nothing_at_the_start() {
-    for name in FIXTURES {
-        let mut reader = open(name);
-        let track_id = reader.tracks()[0].id;
+    within_deadline(|| {
+        for name in FIXTURES {
+            let mut reader = open(name);
+            let track_id = reader.tracks()[0].id;
 
-        // Read past the start, so the start of the track is known.
-        reader.next_packet().unwrap();
+            // Read past the start, so the start of the track is known.
+            reader.next_packet().unwrap();
 
-        let to = SeekTo::Timestamp { ts: Timestamp::new(500), track_id };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+            let to = SeekTo::Timestamp { ts: Timestamp::new(500), track_id };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
 
-        // Decoding begins at least 80 ms before the required timestamp.
-        assert_eq!(seeked.required_ts, Timestamp::new(500), "{name}");
-        assert!(seeked.actual_ts <= Timestamp::new(420), "{name}: {seeked:?}");
+            // Decoding begins at least 80 ms before the required timestamp.
+            assert_eq!(seeked.required_ts, Timestamp::new(500), "{name}");
+            assert!(seeked.actual_ts <= Timestamp::new(420), "{name}: {seeked:?}");
 
-        let packets = packets(&mut reader);
-        assert_eq!(packets[0].pts, seeked.actual_ts, "{name}");
-        assert_eq!(packets[0].trim_start.get(), 0, "{name}: no codec delay in the middle");
+            let packets = packets(&mut reader);
+            assert_eq!(packets[0].pts, seeked.actual_ts, "{name}");
+            assert_eq!(packets[0].trim_start.get(), 0, "{name}: no codec delay in the middle");
 
-        // The packets present from the start of the first packet's block to the end of the track,
-        // 20 ms blocks, less the codec delay before the first.
-        let blocks = (48_000 + 312) / 960 + 1;
-        assert_eq!(
-            presented(&packets),
-            48_000 - (blocks - packets.len() as u64) * 960 + 312,
-            "{name}"
-        );
-    }
+            // The packets present from the start of the first packet's block to the end of the track,
+            // 20 ms blocks, less the codec delay before the first.
+            let blocks = (48_000 + 312) / 960 + 1;
+            assert_eq!(
+                presented(&packets),
+                48_000 - (blocks - packets.len() as u64) * 960 + 312,
+                "{name}"
+            );
+        }
+    });
 }
 
 #[test]
 fn a_seek_by_the_cues_drops_the_rest_of_a_laced_block() {
-    let from_open = packets(&mut open(LACED));
+    within_deadline(|| {
+        let from_open = packets(&mut open(LACED));
 
-    // Once the first frames of a laced block are read, the rest of the block is still to be read. A
-    // seek back to the start or into the track, or forward into the rest of the block, lands as it
-    // would from anywhere else, the codec delay trimmed at the start.
-    for (read, ms) in [(1, 0), (28, 300), (26, 560)] {
-        let mut reader = open(LACED);
-        for _ in 0..read {
-            reader.next_packet().unwrap();
-        }
-
-        let to = SeekTo::Time { time: Time::from_millis(ms), track_id: None };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-
-        let at = landing(&from_open, ms);
-        let what = format!("{read} packets read, then a seek to {ms} ms");
-        assert_eq!(seeked.actual_ts, from_open[at].pts, "{what}");
-        assert_same(&packets(&mut reader), &from_open[at..], &what);
-    }
-}
-
-#[test]
-fn a_failed_seek_keeps_the_rest_of_a_laced_block() {
-    let from_open = packets(&mut open(LACED));
-
-    let mut reader = open(LACED);
-    for _ in 0..26 {
-        reader.next_packet().unwrap();
-    }
-
-    // A seek past the end fails, and the reader reads on from where it was, in a laced block.
-    let to = SeekTo::Time { time: Time::from_millis(10_000), track_id: None };
-    let seeked = reader.seek(SeekMode::Accurate, to);
-    assert!(matches!(seeked, Err(Error::SeekError(SeekErrorKind::OutOfRange))), "{seeked:?}");
-    assert_same(&packets(&mut reader), &from_open[26..], "the packets after the failed seek");
-}
-
-#[test]
-fn a_seek_before_reading_trims_the_codec_delay_of_a_track_that_starts_late() {
-    let mut reader = open(LATE_AUDIO);
-    let opus = opus_track(&reader);
-    let from_open = track_packets(&mut reader, opus);
-
-    // The track starts 1 s after the video (its first block 1001 ms, less the codec delay).
-    assert_eq!(from_open[0].pts, Timestamp::new(994));
-    assert_eq!(from_open[0].trim_start.get(), 312);
-    assert_eq!(presented(&from_open), 48_000);
-
-    // A seek to the start before anything was read, on the video track or on the Opus track, reads
-    // the Opus track's first frame and trims its codec delay.
-    for track_id in [None, Some(opus)] {
-        let mut reader = open(LATE_AUDIO);
-        let to = SeekTo::Time { time: Time::ZERO, track_id };
-        reader.seek(SeekMode::Accurate, to).unwrap();
-
-        let what = format!("a seek to the start on {track_id:?}");
-        assert_same(&track_packets(&mut reader, opus), &from_open, &what);
-    }
-}
-
-#[test]
-fn a_seek_to_a_late_track_after_reading_up_to_its_cluster_trims_its_codec_delay() {
-    let mut reader = open(LATE_AUDIO);
-    let opus = opus_track(&reader);
-    let from_open = track_packets(&mut reader, opus);
-
-    // Read into the second cluster, before the Opus track's first block.
-    let mut reader = open(LATE_AUDIO);
-    read_before_track(&mut reader, opus, 600);
-
-    // A seek to the start of the Opus track, into what follows what was read, reads the track's
-    // first frame and trims its codec delay.
-    let to = SeekTo::Time { time: Time::from_millis(1000), track_id: Some(opus) };
-    let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-
-    assert_eq!(seeked.actual_ts, from_open[0].pts);
-    assert_same(&track_packets(&mut reader, opus), &from_open, "a seek to 1 s");
-}
-
-#[test]
-fn a_seek_back_from_past_what_was_read_trims_by_where_the_track_starts() {
-    let mut reader = open(LATE_AUDIO);
-    let opus = opus_track(&reader);
-    let from_open = track_packets(&mut reader, opus);
-
-    // Read into the second cluster, before the Opus track's first block, then seek past everything
-    // read, to the fourth cluster, and read a packet of the track there.
-    let mut reader = open(LATE_AUDIO);
-    read_before_track(&mut reader, opus, 600);
-
-    let to = SeekTo::Time { time: Time::from_millis(1500), track_id: Some(opus) };
-    reader.seek(SeekMode::Accurate, to).unwrap();
-    while reader.next_packet().unwrap().expect("a packet").track_id != opus {}
-
-    // A seek back to 100 ms after the track's start takes the pre-roll and trims nothing...
-    let to = SeekTo::Time { time: Time::from_millis(1100), track_id: Some(opus) };
-    let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-
-    let at = landing(&from_open, 1100);
-    assert_eq!(seeked.actual_ts, from_open[at].pts);
-    assert_same(&track_packets(&mut reader, opus), &from_open[at..], "a seek to 1.1 s");
-
-    // ...and a seek to the start trims the codec delay.
-    let to = SeekTo::Time { time: Time::ZERO, track_id: Some(opus) };
-    reader.seek(SeekMode::Accurate, to).unwrap();
-    assert_same(&track_packets(&mut reader, opus), &from_open, "a seek to the start");
-}
-
-#[test]
-fn a_seek_before_the_first_cue_point_reads_from_the_first_cluster() {
-    let mut reader = open("opus_offset.mka");
-    let from_open = packets(&mut reader);
-
-    // The track is stored from 100 ms, where its only cue point is.
-    assert_eq!(from_open[0].pts, Timestamp::new(93));
-    assert_eq!(from_open[0].trim_start.get(), 312);
-    assert_eq!(presented(&from_open), 48_000);
-
-    // A seek to the start, or to within the pre-roll after the cue point, lands on the first frame,
-    // before anything was read and after reading to the end.
-    for ms in [0, 120] {
-        for read_first in [false, true] {
-            let mut reader = open("opus_offset.mka");
-            if read_first {
-                packets(&mut reader);
+        // Once the first frames of a laced block are read, the rest of the block is still to be read. A
+        // seek back to the start or into the track, or forward into the rest of the block, lands as it
+        // would from anywhere else, the codec delay trimmed at the start.
+        for (read, ms) in [(1, 0), (28, 300), (26, 560)] {
+            let mut reader = open(LACED);
+            for _ in 0..read {
+                reader.next_packet().unwrap();
             }
 
             let to = SeekTo::Time { time: Time::from_millis(ms), track_id: None };
             let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
 
-            let what = format!("a seek to {ms} ms, the track read first: {read_first}");
-            assert_eq!(seeked.actual_ts, from_open[0].pts, "{what}");
-            assert_same(&packets(&mut reader), &from_open, &what);
+            let at = landing(&from_open, ms);
+            let what = format!("{read} packets read, then a seek to {ms} ms");
+            assert_eq!(seeked.actual_ts, from_open[at].pts, "{what}");
+            assert_same(&packets(&mut reader), &from_open[at..], &what);
         }
-    }
+    });
+}
+
+#[test]
+fn a_failed_seek_keeps_the_rest_of_a_laced_block() {
+    within_deadline(|| {
+        let from_open = packets(&mut open(LACED));
+
+        let mut reader = open(LACED);
+        for _ in 0..26 {
+            reader.next_packet().unwrap();
+        }
+
+        // A seek past the end fails, and the reader reads on from where it was, in a laced block.
+        let to = SeekTo::Time { time: Time::from_millis(10_000), track_id: None };
+        let seeked = reader.seek(SeekMode::Accurate, to);
+        assert!(matches!(seeked, Err(Error::SeekError(SeekErrorKind::OutOfRange))), "{seeked:?}");
+        assert_same(&packets(&mut reader), &from_open[26..], "the packets after the failed seek");
+    });
+}
+
+#[test]
+fn a_seek_before_reading_trims_the_codec_delay_of_a_track_that_starts_late() {
+    within_deadline(|| {
+        let mut reader = open(LATE_AUDIO);
+        let opus = opus_track(&reader);
+        let from_open = track_packets(&mut reader, opus);
+
+        // The track starts 1 s after the video (its first block 1001 ms, less the codec delay).
+        assert_eq!(from_open[0].pts, Timestamp::new(994));
+        assert_eq!(from_open[0].trim_start.get(), 312);
+        assert_eq!(presented(&from_open), 48_000);
+
+        // A seek to the start before anything was read, on the video track or on the Opus track, reads
+        // the Opus track's first frame and trims its codec delay.
+        for track_id in [None, Some(opus)] {
+            let mut reader = open(LATE_AUDIO);
+            let to = SeekTo::Time { time: Time::ZERO, track_id };
+            reader.seek(SeekMode::Accurate, to).unwrap();
+
+            let what = format!("a seek to the start on {track_id:?}");
+            assert_same(&track_packets(&mut reader, opus), &from_open, &what);
+        }
+    });
+}
+
+#[test]
+fn a_seek_to_a_late_track_after_reading_up_to_its_cluster_trims_its_codec_delay() {
+    within_deadline(|| {
+        let mut reader = open(LATE_AUDIO);
+        let opus = opus_track(&reader);
+        let from_open = track_packets(&mut reader, opus);
+
+        // Read into the second cluster, before the Opus track's first block.
+        let mut reader = open(LATE_AUDIO);
+        read_before_track(&mut reader, opus, 600);
+
+        // A seek to the start of the Opus track, into what follows what was read, reads the track's
+        // first frame and trims its codec delay.
+        let to = SeekTo::Time { time: Time::from_millis(1000), track_id: Some(opus) };
+        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+
+        assert_eq!(seeked.actual_ts, from_open[0].pts);
+        assert_same(&track_packets(&mut reader, opus), &from_open, "a seek to 1 s");
+    });
+}
+
+#[test]
+fn a_seek_back_from_past_what_was_read_trims_by_where_the_track_starts() {
+    within_deadline(|| {
+        let mut reader = open(LATE_AUDIO);
+        let opus = opus_track(&reader);
+        let from_open = track_packets(&mut reader, opus);
+
+        // Read into the second cluster, before the Opus track's first block, then seek past everything
+        // read, to the fourth cluster, and read a packet of the track there.
+        let mut reader = open(LATE_AUDIO);
+        read_before_track(&mut reader, opus, 600);
+
+        let to = SeekTo::Time { time: Time::from_millis(1500), track_id: Some(opus) };
+        reader.seek(SeekMode::Accurate, to).unwrap();
+        while reader.next_packet().unwrap().expect("a packet").track_id != opus {}
+
+        // A seek back to 100 ms after the track's start takes the pre-roll and trims nothing...
+        let to = SeekTo::Time { time: Time::from_millis(1100), track_id: Some(opus) };
+        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+
+        let at = landing(&from_open, 1100);
+        assert_eq!(seeked.actual_ts, from_open[at].pts);
+        assert_same(&track_packets(&mut reader, opus), &from_open[at..], "a seek to 1.1 s");
+
+        // ...and a seek to the start trims the codec delay.
+        let to = SeekTo::Time { time: Time::ZERO, track_id: Some(opus) };
+        reader.seek(SeekMode::Accurate, to).unwrap();
+        assert_same(&track_packets(&mut reader, opus), &from_open, "a seek to the start");
+    });
+}
+
+#[test]
+fn a_seek_before_the_first_cue_point_reads_from_the_first_cluster() {
+    within_deadline(|| {
+        let mut reader = open("opus_offset.mka");
+        let from_open = packets(&mut reader);
+
+        // The track is stored from 100 ms, where its only cue point is.
+        assert_eq!(from_open[0].pts, Timestamp::new(93));
+        assert_eq!(from_open[0].trim_start.get(), 312);
+        assert_eq!(presented(&from_open), 48_000);
+
+        // A seek to the start, or to within the pre-roll after the cue point, lands on the first frame,
+        // before anything was read and after reading to the end.
+        for ms in [0, 120] {
+            for read_first in [false, true] {
+                let mut reader = open("opus_offset.mka");
+                if read_first {
+                    packets(&mut reader);
+                }
+
+                let to = SeekTo::Time { time: Time::from_millis(ms), track_id: None };
+                let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+
+                let what = format!("a seek to {ms} ms, the track read first: {read_first}");
+                assert_eq!(seeked.actual_ts, from_open[0].pts, "{what}");
+                assert_same(&packets(&mut reader), &from_open, &what);
+            }
+        }
+    });
 }
 
 #[test]
 fn a_seek_before_the_first_cue_point_of_another_track_takes_the_pre_roll() {
-    let mut reader = open("opus_late_video.mkv");
-    let opus = opus_track(&reader);
-    let from_open = track_packets(&mut reader, opus);
-    assert_eq!(presented(&from_open), 48_000);
-
-    // The video, which the cue points index, starts in the second cluster, 0.6 s into the Opus
-    // track. A seek on the Opus track before then lands on the frame the pre-roll begins in.
-    for ms in [0, 100, 500] {
+    within_deadline(|| {
         let mut reader = open("opus_late_video.mkv");
-        let to = SeekTo::Time { time: Time::from_millis(ms), track_id: Some(opus) };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+        let opus = opus_track(&reader);
+        let from_open = track_packets(&mut reader, opus);
+        assert_eq!(presented(&from_open), 48_000);
 
-        let at = landing(&from_open, ms);
-        let what = format!("a seek to {ms} ms");
-        assert_eq!(seeked.actual_ts, from_open[at].pts, "{what}");
-        assert_same(&track_packets(&mut reader, opus), &from_open[at..], &what);
-    }
+        // The video, which the cue points index, starts in the second cluster, 0.6 s into the Opus
+        // track. A seek on the Opus track before then lands on the frame the pre-roll begins in.
+        for ms in [0, 100, 500] {
+            let mut reader = open("opus_late_video.mkv");
+            let to = SeekTo::Time { time: Time::from_millis(ms), track_id: Some(opus) };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+
+            let at = landing(&from_open, ms);
+            let what = format!("a seek to {ms} ms");
+            assert_eq!(seeked.actual_ts, from_open[at].pts, "{what}");
+            assert_same(&track_packets(&mut reader, opus), &from_open[at..], &what);
+        }
+    });
 }
 
 /// An EBML element: its ID, its size (an 8-byte variable-size integer) and its data.

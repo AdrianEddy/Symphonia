@@ -512,8 +512,22 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
         // Get the current depth in the EBML document.
         let depth = self.depth();
 
+        let pos = self.reader.pos();
+
         // Read an EBML element header.
-        let header = EbmlElementHeader::read(&mut self.reader, depth, &self.schema)?;
+        let header = match EbmlElementHeader::read(&mut self.reader, depth, &self.schema) {
+            // An element of unknown size also ends at the end of the EBML document (RFC 8794,
+            // section 6.2): the document ending where the next element would begin is the end of
+            // the parent element.
+            Err(EbmlError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof
+                    && parent_end.is_none()
+                    && self.reader.pos() == pos =>
+            {
+                return Ok(None);
+            }
+            result => result?,
+        };
 
         // let indent = 2 * header.depth as usize;
         // log::trace!(

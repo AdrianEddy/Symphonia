@@ -114,18 +114,6 @@ impl MatroskaTicks {
         self.0
     }
 
-    /// Convert `self` into Segment ticks using the segment timebase.
-    ///
-    /// The Segment timebase is the media timebase.
-    #[inline]
-    pub fn into_segment_ticks(self, segment_time_base: TimeBase) -> SegmentTicks {
-        // The timebase may have been reduced so it is not possible to assume a 1_000_000_000
-        // denominator.
-        let factor = (1_000_000_000 * u64::from(segment_time_base.numer.get()))
-            / u64::from(segment_time_base.denom.get());
-        SegmentTicks(self.0 / factor)
-    }
-
     /// Convert `self` into Track ticks using the track timebase.
     #[inline]
     pub fn into_track_ticks(self, track_time_base: TimeBase) -> TrackTicks {
@@ -223,13 +211,14 @@ impl SegmentTicks {
         self.0
     }
 
-    /// Convert `self` into Track ticks using the track's timestamp scale.
+    /// Convert `self` into Track ticks using the track's timestamp scale: a Track tick is
+    /// `TrackTimestampScale` Segment ticks. Rounded to the nearest Track tick.
     #[inline]
     pub fn into_track_ticks(self, track_timestamp_scale: f64) -> TrackTicks {
         if track_timestamp_scale == 1.0 {
             return TrackTicks(self.0);
         }
-        TrackTicks((self.0 as f64 * track_timestamp_scale).round() as u64)
+        TrackTicks((self.0 as f64 / track_timestamp_scale).round() as u64)
     }
 }
 
@@ -342,15 +331,6 @@ impl SignedTrackTicks {
     #[inline]
     pub fn checked_sub_unsigned(self, other: TrackTicks) -> Option<Self> {
         self.0.checked_sub_unsigned(other.0).map(SignedTrackTicks)
-    }
-
-    /// Try to convert Segment ticks to Matroska ticks using the track timebase.
-    #[inline]
-    pub fn try_into_matroska_ticks(self, track_time_base: TimeBase) -> Option<MatroskaTicks> {
-        if self.0.is_negative() {
-            return None;
-        }
-        (self.0 as u64).checked_mul(u64::from(track_time_base.numer.get())).map(MatroskaTicks)
     }
 }
 
@@ -1088,6 +1068,11 @@ impl EbmlElement<MkvSchema> for CuesElement {
             }
         }
 
+        // A seek searches the cue points by time. They should be stored in that order (RFC 9559,
+        // section 22), but need not be: sort them, stably, so cue points of the same time keep
+        // their order.
+        points.sort_by_key(|point: &CuePointElement| point.time);
+
         Ok(Self { points: points.into_boxed_slice() })
     }
 }
@@ -1095,8 +1080,8 @@ impl EbmlElement<MkvSchema> for CuesElement {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct CuePointElement {
-    /// Time in segment ticks.
-    pub(crate) time: MatroskaTicks,
+    /// Time in segment ticks, scaled by `TimestampScale` as a Cluster's Timestamp is.
+    pub(crate) time: SegmentTicks,
     pub(crate) positions: CueTrackPositionsElement,
 }
 
@@ -1111,7 +1096,7 @@ impl EbmlElement<MkvSchema> for CuePointElement {
             match child.element_type() {
                 MkvElement::CueTime => {
                     // Mandatory element. No schema-defined default.
-                    time = Some(MatroskaTicks(it.read_u64_no_default()?));
+                    time = Some(SegmentTicks(it.read_u64_no_default()?));
                 }
                 MkvElement::CueTrackPositions => {
                     // Mandatory element.

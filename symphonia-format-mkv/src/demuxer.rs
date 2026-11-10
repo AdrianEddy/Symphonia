@@ -24,7 +24,7 @@ use crate::codecs::make_track_codec_params;
 use crate::ebml::{
     EbmlElementInfo, EbmlError, EbmlIterator, EbmlIteratorState, EbmlSchema, ReadEbml,
 };
-use crate::lacing::{Frame, extract_frames};
+use crate::lacing::{Frame, calculate_block_pts, extract_frames};
 use crate::opus::OpusTrim;
 use crate::schema::{MkvElement, MkvSchema};
 use crate::segment::{
@@ -54,6 +54,10 @@ pub struct TrackState {
     seek_pre_roll: TrackTicks,
     /// For an Opus track, its gapless trimming state.
     pub(crate) opus: Option<OpusTrim>,
+    /// The timestamp and duration (0 if unknown) of the track's frame the reader read past last,
+    /// handed out or dropped by a seek: on a source the reader can't seek in, a seek can't reach it
+    /// or a frame before it.
+    last_read: Option<(Timestamp, TrackTicks)>,
 }
 
 /// Matroska (MKV) and WebM demultiplexer.
@@ -64,8 +68,13 @@ pub struct MkvReader<'s> {
     iter: EbmlIterator<MediaSourceStream<'s>, MkvSchema>,
     /// The state of the iterator at the start of the Segment element's children.
     segment_state: EbmlIteratorState<MkvSchema>,
+    /// The position of the Segment element's data, which its children's positions are relative to.
+    segment_pos: u64,
     /// The position of the first Cluster element, relative to the Segment element's data.
     first_cluster_pos: u64,
+    /// Whether the source can seek. A seek on a source that can't is read on from where the reader
+    /// is.
+    is_seekable: bool,
     media_info: MediaInfo,
     tracks: Vec<Track>,
     track_states: HashMap<u32, TrackState>,
@@ -73,6 +82,10 @@ pub struct MkvReader<'s> {
     chapters: Option<ChapterGroup>,
     metadata: MetadataLog,
     cues: Option<CuesElement>,
+    /// Without Cues, on a source that can seek: the timestamp and the position (relative to the
+    /// Segment element's data) of each cluster read, in order from the first, an index built while
+    /// reading that a seek searches as it would the Cues.
+    clusters: Vec<(SegmentTicks, u64)>,
     current_cluster: Option<ClusterState>,
     frames: VecDeque<Frame>,
     /// Every element from the start of the first cluster up to this position has been read.
@@ -86,7 +99,7 @@ pub struct MkvReader<'s> {
 struct ClusterState {
     /// The cluster timestamp in Segment ticks..
     timestamp: Option<SegmentTicks>,
-    /// The start position in bytes of the cluster.
+    /// The position of the cluster element, relative to the Segment element's data.
     start: u64,
 }
 
@@ -292,11 +305,14 @@ impl<'s> MkvReader<'s> {
             .unwrap_or_default();
 
         // Should TimeBase use a u64/u64 rational?
+        let timestamp_scale: NonZero<u32> = info
+            .timestamp_scale
+            .try_into()
+            .map_err(|_| Error::Unsupported("mkv: timestamp scale too large (report this)"))?;
+
         // Reduce the timebase to reduce the chance of overflows later.
         let time_base = TimeBase::new(
-            info.timestamp_scale
-                .try_into()
-                .map_err(|_| Error::Unsupported("mkv: timestamp scale too large (report this)"))?,
+            timestamp_scale,
             NonZero::new(1_000_000_000).expect("1_000_000_000 is non-zero"),
         )
         .reduce();
@@ -305,10 +321,15 @@ impl<'s> MkvReader<'s> {
         let mut track_states = HashMap::new();
 
         for track in segment_tracks.tracks {
-            // The track's timebase is scaled by the track timestamp scale.
-            let track_time_base = time_base
-                .scale(track.track_timestamp_scale)
-                .ok_or(Error::DecodeError("mkv: track timebase is invalid"))?;
+            // A Track tick is `TimestampScale * TrackTimestampScale` nanoseconds, rounded to a whole
+            // nanosecond: the track's timebase before it is reduced, so a fractional scale is kept.
+            // A scale that is not positive, or not a number, gives no nanoseconds (`as` saturates).
+            let tick_ns = (f64::from(timestamp_scale.get()) * track.track_timestamp_scale).round();
+
+            let track_time_base = TimeBase::try_new(tick_ns as u32, 1_000_000_000)
+                .filter(|_| tick_ns <= f64::from(u32::MAX))
+                .ok_or(Error::DecodeError("mkv: track timebase is invalid"))?
+                .reduce();
 
             let codec_delay = track.codec_delay.into_track_ticks_rounded(track_time_base);
 
@@ -324,6 +345,7 @@ impl<'s> MkvReader<'s> {
                 seek_pre_roll: track.seek_pre_roll.into_track_ticks_rounded_up(track_time_base),
                 opus: (track.codec_id == "A_OPUS")
                     .then(|| OpusTrim::new(track.codec_delay, codec_delay, track_time_base)),
+                last_read: None,
             };
 
             // Create the track.
@@ -360,7 +382,9 @@ impl<'s> MkvReader<'s> {
         Ok(Self {
             iter: it,
             segment_state,
+            segment_pos,
             first_cluster_pos,
+            is_seekable,
             media_info,
             tracks,
             track_states,
@@ -368,6 +392,7 @@ impl<'s> MkvReader<'s> {
             chapters,
             metadata,
             cues,
+            clusters: Vec::new(),
             current_cluster,
             frames: VecDeque::new(),
             read_to,
@@ -375,64 +400,182 @@ impl<'s> MkvReader<'s> {
         })
     }
 
-    /// Skip frames until the frame of the track `track_id` that contains `ts`. `required_ts` is the
-    /// timestamp the seek was asked for, which `ts` precedes by the seek pre-roll.
+    /// Skip the frames before the frame of the track `track_id` that holds `ts`: the first frame of
+    /// the track that ends at or after `ts`. A frame whose duration is unknown (no BlockDuration, no
+    /// DefaultDuration, none from the codec) ends where the track's next frame that begins later
+    /// begins, so it is held until that frame, a cluster that begins after `ts`, or the end is read.
+    /// `required_ts` is the timestamp the seek was asked for, which `ts` precedes by the seek
+    /// pre-roll. If `behind_if_after`, the frame of the track the reader read past last, of unknown
+    /// duration, may hold `required_ts`: it does, and the target lies behind the reader, if the
+    /// track's next frame begins after `required_ts`. `before` is the position of a cluster before
+    /// the one whose start the reader reads from, where the frame that holds `ts` may lie: if the
+    /// reader reads no frame of the track that begins at or before `ts` before one that begins
+    /// after it, a cluster that begins after it or the end, it reads from that cluster, once.
     fn seek_track_by_ts_forward(
         &mut self,
         track_id: u32,
         ts: Timestamp,
         required_ts: Timestamp,
+        mut behind_if_after: bool,
+        mut before: Option<u64>,
     ) -> Result<SeekedTo> {
+        // The index of the next frame to look at. While it is not 0, the frame at the front of the
+        // queue is held: a frame of the track that begins before `ts`, of unknown duration. The
+        // frames after it are kept with it, as they follow it if it holds `ts`.
+        let mut next = 0;
+
         let actual_ts = 'out: loop {
-            // Skip frames from the buffer until the given timestamp
-            while let Some(frame) = self.frames.front() {
-                let next_frame_pts = frame
-                    .pts
-                    .into_ts()
-                    .checked_add(frame.dur.into_dur())
+            while let Some(frame) = self.frames.get(next) {
+                let (track_num, pts, dur) = (frame.track_num, frame.pts.into_ts(), frame.dur);
+
+                if next > 0 {
+                    let held = self.frames[0].pts.into_ts();
+
+                    if track_num != track_id || pts <= held {
+                        // A frame of another track, or one laced with the held frame (it begins
+                        // where the held frame does).
+                        next += 1;
+                    }
+                    else if pts > ts {
+                        // The held frame ends after `ts`, where this frame begins: it holds `ts`.
+                        break 'out held;
+                    }
+                    else {
+                        // The held frame ends at or before `ts`. Look at this frame as the first.
+                        self.drop_frames(next);
+                        next = 0;
+                    }
+                    continue;
+                }
+
+                if track_num != track_id {
+                    self.drop_frames(1);
+                    continue;
+                }
+
+                // The track's first frame read decides on `before`: if it begins after `ts`, the
+                // frame that holds `ts` may lie in a cluster before. Read from there.
+                if let Some(pos) = before.take().filter(|_| pts > ts) {
+                    self.read_from_cluster(pos, None)?;
+                    continue;
+                }
+
+                if behind_if_after {
+                    if pts > required_ts {
+                        return seek_error(SeekErrorKind::ForwardOnly);
+                    }
+                    behind_if_after = false;
+                }
+
+                if dur.get() == 0 && pts < ts {
+                    next = 1;
+                    continue;
+                }
+
+                let end = pts
+                    .checked_add(dur.into_dur())
                     .ok_or(Error::SeekError(SeekErrorKind::OutOfRange))?;
 
-                if next_frame_pts >= ts && frame.track_num == track_id {
-                    break 'out frame.pts.into_ts();
+                if end >= ts {
+                    break 'out pts;
                 }
-                else {
-                    self.frames.pop_front();
-                }
+
+                self.drop_frames(1);
             }
 
-            if !self.next_element()? {
-                // There are no more elements.
-                return Err(Error::SeekError(SeekErrorKind::OutOfRange));
+            let read = self.next_element()?;
+
+            // No frame of the track read yet, and none read on begins at or before `ts` (at the end,
+            // or in a cluster that begins after it): the frame that holds `ts` may lie in a cluster
+            // before. Read from there.
+            if let Some(pos) = before.take_if(|_| !read || self.cluster_begins_after(track_id, ts))
+            {
+                self.read_from_cluster(pos, None)?;
+                continue;
+            }
+
+            if !read {
+                // There are no more elements. The track's last frame, held or read past, holds a
+                // timestamp the Segment does not end before.
+                if next > 0 && !self.ends_before(track_id, ts) {
+                    break 'out self.frames[0].pts.into_ts();
+                }
+                if behind_if_after && !self.ends_before(track_id, required_ts) {
+                    return seek_error(SeekErrorKind::ForwardOnly);
+                }
+                return seek_error(SeekErrorKind::OutOfRange);
+            }
+
+            // The track's frames in a cluster that begins after a timestamp begin after it too, so
+            // the track's frame held, or read past last, holds it.
+            if next > 0 && self.cluster_begins_after(track_id, ts) {
+                break 'out self.frames[0].pts.into_ts();
+            }
+            if behind_if_after && self.cluster_begins_after(track_id, required_ts) {
+                return seek_error(SeekErrorKind::ForwardOnly);
             }
         };
 
         Ok(SeekedTo { track_id, required_ts, actual_ts })
     }
 
-    fn seek_track_by_ts_atomic(
-        &mut self,
-        id: u32,
-        tb: TimeBase,
-        ts: Timestamp,
-    ) -> Result<SeekedTo> {
-        // Save the iterator and cluster states to restore in-case of and error.
-        let iter_state = self.iter.save_state();
-        let cluster_state = self.current_cluster;
-        let read_all_before = self.read_all_before;
+    /// Whether the frames of the track `track_id` in the cluster being read begin after `ts`: the
+    /// cluster begins after `ts`. (A block's timestamp relative to its cluster's is negative only
+    /// where frames are reordered.)
+    fn cluster_begins_after(&self, track_id: u32, ts: Timestamp) -> bool {
+        let Some(cluster_ts) = self.current_cluster.and_then(|cluster| cluster.timestamp)
+        else {
+            return false;
+        };
 
-        // A seek by the cues moves the reader, so the frames still queued from the block read last
-        // do not follow where it lands. Set them aside, to restore if the seek fails. A seek without
-        // cues reads on from them.
-        let queued = self.cues.is_some().then(|| std::mem::take(&mut self.frames));
+        let state = &self.track_states[&track_id];
+        let begin = calculate_block_pts(cluster_ts, SignedTrackTicks::default(), state);
 
-        match self.seek_track_by_ts(id, tb, ts) {
+        begin.is_some_and(|begin| begin.into_ts() > ts)
+    }
+
+    /// Drop the first `n` frames of the queue, which the reader reads past.
+    fn drop_frames(&mut self, n: usize) {
+        for frame in self.frames.drain(..n) {
+            if let Some(state) = self.track_states.get_mut(&frame.track_num) {
+                state.last_read = Some((frame.pts.into_ts(), frame.dur));
+            }
+        }
+    }
+
+    /// Whether the Segment, if it states its duration, ends before the timestamp `ts` of the track
+    /// `track_id`.
+    fn ends_before(&self, track_id: u32, ts: Timestamp) -> bool {
+        let Some(duration) = self.media_info.duration
+        else {
+            return false;
+        };
+
+        let scale = self.track_states[&track_id].track_timestamp_scale;
+        let end = SegmentTicks::from(duration.get()).into_track_ticks(scale).try_into_signed();
+
+        end.is_some_and(|end| end.into_ts() < ts)
+    }
+
+    fn seek_track_by_ts_atomic(&mut self, id: u32, ts: Timestamp) -> Result<SeekedTo> {
+        // A seek on a source that can seek moves the reader. Save the iterator and cluster states to
+        // restore in case of an error, and set the frames still queued from the block read last
+        // aside, to restore too: they do not follow where the reader lands. On a source that can't
+        // seek, a seek reads on from where the reader is, and a failed seek can't return: the reader
+        // reads on from where the seek stopped.
+        let saved = self.is_seekable.then(|| {
+            let frames = std::mem::take(&mut self.frames);
+            (self.iter.save_state(), self.current_cluster, self.read_all_before, frames)
+        });
+
+        match self.seek_track_by_ts(id, ts) {
             Err(err) => {
                 // Restore saved iterator and cluster states, and the frames set aside.
-                self.iter.restore_state(iter_state)?;
-                self.current_cluster = cluster_state;
-                self.read_all_before = read_all_before;
-                if let Some(queued) = queued {
-                    self.frames = queued;
+                if let Some((iter_state, cluster_state, read_all_before, frames)) = saved {
+                    self.iter.restore_state(iter_state)?;
+                    self.current_cluster = cluster_state;
+                    self.read_all_before = read_all_before;
+                    self.frames = frames;
                 }
                 Err(err)
             }
@@ -449,125 +592,221 @@ impl<'s> MkvReader<'s> {
         }
     }
 
-    fn seek_track_by_ts(
-        &mut self,
-        id: u32,
-        tb: TimeBase,
-        required_ts: Timestamp,
-    ) -> Result<SeekedTo> {
+    fn seek_track_by_ts(&mut self, id: u32, required_ts: Timestamp) -> Result<SeekedTo> {
         log::debug!("seeking track_id={id} to ts={required_ts}");
+
+        let state = &self.track_states[&id];
+        let (pre_roll, track_timestamp_scale) = (state.seek_pre_roll, state.track_timestamp_scale);
 
         // Decoding begins the seek pre-roll before the required timestamp, so that the decoded
         // data is valid from the required timestamp on.
-        let pre_roll = self.track_states.get(&id).map(|state| state.seek_pre_roll);
-        let ts = required_ts.saturating_sub(pre_roll.unwrap_or_default().into_dur());
+        let ts = required_ts.saturating_sub(pre_roll.into_dur());
 
-        // If cues exist, seek to the nearest cue point.
-        if let Some(cues) = &self.cues {
-            let mut target_cue_point = None;
+        // A source that can't seek is read on from where the reader is. That reaches the target
+        // unless the reader has read past the frame of the track that holds it: the track's frame
+        // the reader read past last must end at or before the target, and if its duration is
+        // unknown, the track's next frame shows where it ends. The seek pre-roll is read as far as
+        // the reader has not read past it.
+        if !self.is_seekable {
+            let mut behind_if_after = false;
 
-            // Cue points store timestamps in Matroska ticks while the timestamp being seeked to is
-            // in signed Track ticks. Convert to unsigned Matroska ticks for iterating the cue
-            // points. If the required timestamp is negative, then this is an error because cue
-            // points only contain unsigned Matroska ticks.
-            if required_ts.is_negative() {
-                return seek_error(SeekErrorKind::OutOfRange);
+            if let Some((pts, dur)) = self.track_states[&id].last_read {
+                let behind = if dur.get() > 0 {
+                    required_ts < pts.saturating_add(dur.into_dur())
+                }
+                else {
+                    match self.frames.iter().find(|frame| frame.track_num == id) {
+                        Some(frame) => required_ts < frame.pts.into_ts(),
+                        None if required_ts < pts => true,
+                        None => {
+                            // The track's next frame is not read yet.
+                            behind_if_after = true;
+                            false
+                        }
+                    }
+                };
+
+                if behind {
+                    return seek_error(SeekErrorKind::ForwardOnly);
+                }
             }
 
-            let ts = SignedTrackTicks::from(ts.max(Timestamp::ZERO))
-                .try_into_matroska_ticks(tb)
-                .ok_or(Error::SeekError(SeekErrorKind::OutOfRange))?;
-
-            for cue_point in &cues.points {
-                if cue_point.time > ts {
-                    break;
-                }
-                target_cue_point = Some(cue_point);
-            }
-
-            // Read from the cluster of the cue point. If the timestamp precedes every cue point,
-            // read from the first cluster: the cue points may index another track, so the track's
-            // blocks may begin before the first of them.
-            let (cluster_pos, cluster_ts, cluster_rel_pos) = match target_cue_point {
-                Some(cue_point) => {
-                    log::debug!(
-                        "found cue point: track_id={}, ts={}, seg_pos={}",
-                        cue_point.positions.track.get(),
-                        cue_point.time,
-                        cue_point.positions.cluster_pos
-                    );
-
-                    // Convert the cue point's timestamp (Matroska ticks) into Segment ticks for
-                    // the cluster state.
-                    let timestamp = cue_point.time.into_segment_ticks(
-                        self.media_info.time_base.expect("media info time base always populated"),
-                    );
-
-                    let positions = &cue_point.positions;
-                    (positions.cluster_pos, Some(timestamp), positions.cluster_rel_pos)
-                }
-                None => {
-                    log::debug!("no cue point at or before ts={ts}, reading the first cluster");
-
-                    // The cluster timestamp is read from the cluster's Timestamp element.
-                    (self.first_cluster_pos, None, None)
-                }
-            };
-
-            // Ascend back to the segment element. If the end of the segment was reached, the
-            // iterator has left the segment element, so return into it.
-            match self.iter.pop_elements_upto(MkvElement::Segment) {
-                Err(EbmlError::NotAnAncestor) => {
-                    self.iter.restore_state(self.segment_state.clone())?;
-                }
-                result => result?,
-            }
-
-            // Seek to the specific cluster element.
-            self.iter.seek_to_child(cluster_pos)?;
-
-            // Resume iteration.
-            let cluster = match self.iter.next_header()? {
-                // The seeked element is a cluster.
-                Some(header) if header.element_type() == MkvElement::Cluster => header,
-                // The seeked element is not a cluster or there were no more elements at the cue
-                // position. The cue point was malformed.
-                _ => return seek_error(SeekErrorKind::Unseekable),
-            };
-
-            // Whether every element before the cluster has been read.
-            let read_before = cluster.pos() <= self.read_to;
-
-            // Update the current cluster metadata.
-            self.current_cluster =
-                Some(ClusterState { timestamp: cluster_ts, start: cluster.pos() });
-
-            // Descend into the cluster element.
-            self.iter.push_element()?;
-
-            // While the first frame of an Opus track has not been read, a cluster before which every
-            // element has been read is read from its start, not from the cue point's block: the
-            // track's first frame may precede that block, and a frame is known to be the track's
-            // first only if every element before it has been read.
-            let from_start = read_before
-                && self
-                    .track_states
-                    .values()
-                    .any(|state| state.opus.as_ref().is_some_and(|opus| !opus.knows_start()));
-
-            // Otherwise, if a cluster relative position is available, seek to the exact simple
-            // block or block group element.
-            self.read_all_before = match cluster_rel_pos {
-                Some(cluster_rel_pos) if !from_start => {
-                    self.iter.seek_to_child(cluster_rel_pos)?;
-                    self.iter.pos() <= self.read_to
-                }
-                _ => read_before,
-            };
+            return self.seek_track_by_ts_forward(id, ts, required_ts, behind_if_after, None);
         }
 
+        // Read from the cluster of the cue point at or before the timestamp or, without cues, from
+        // the last cluster read that begins at or before it. Unless the cue point is the track's,
+        // the frame of the track that holds the timestamp may lie in a cluster before that one: a
+        // muxer may store the audio frame that spans a video keyframe at the end of the cluster
+        // before the keyframe's (FFmpeg does, for every audio track but one). `before` is a
+        // cluster before it to read from then.
+        let (cluster_pos, cued_block_pos, before) = match &self.cues {
+            Some(cues) => {
+                // Cue points store unsigned timestamps in Segment ticks while the timestamp being
+                // seeked to is in signed Track ticks. Convert the cue points' timestamps into the
+                // track's ticks to compare them. If the required timestamp is negative, then this
+                // is an error because cue points only contain unsigned timestamps.
+                if required_ts.is_negative() {
+                    return seek_error(SeekErrorKind::OutOfRange);
+                }
+
+                let ts = TrackTicks::from(ts.max(Timestamp::ZERO).get() as u64);
+
+                // The cue points are sorted by time (`CuesElement::read`).
+                let after = cues.points.partition_point(|cue_point| {
+                    cue_point.time.into_track_ticks(track_timestamp_scale) <= ts
+                });
+
+                // Read from the cluster of the last cue point at or before the timestamp. If the
+                // timestamp precedes every cue point, read from the first cluster: the cue points
+                // may index another track, so the track's blocks may begin before the first of
+                // them.
+                match after.checked_sub(1) {
+                    Some(last) => {
+                        let cue_point = &cues.points[last];
+                        let positions = &cue_point.positions;
+
+                        log::debug!(
+                            "found cue point: track_id={}, ts={}, seg_pos={}",
+                            positions.track.get(),
+                            cue_point.time,
+                            positions.cluster_pos
+                        );
+
+                        // A cue point of the track being seeked leads to its block: the track's
+                        // frames before that block end by the cue point's time. In the cluster of
+                        // another track's cue point, frames of the track that hold the timestamp
+                        // may precede the cued block, so that cluster is read from its start, or
+                        // lie in a cluster before: the cluster of an earlier cue point, or the
+                        // first.
+                        if positions.track.get() == u64::from(id) {
+                            (positions.cluster_pos, positions.cluster_rel_pos, None)
+                        }
+                        else {
+                            let before = cues.points[..last]
+                                .iter()
+                                .rev()
+                                .map(|cue_point| cue_point.positions.cluster_pos)
+                                .chain([self.first_cluster_pos])
+                                .find(|&pos| pos < positions.cluster_pos);
+
+                            (positions.cluster_pos, None, before)
+                        }
+                    }
+                    None => {
+                        log::debug!("no cue point at or before ts={ts}, reading the first cluster");
+                        (self.first_cluster_pos, None, None)
+                    }
+                }
+            }
+            None => {
+                // The clusters read are indexed in order from the first (`next_element`), so the
+                // last cluster indexed that begins at or before the timestamp is the last cluster
+                // read that does, and the cluster indexed before that one is the cluster before
+                // it. If none does, read from the first cluster.
+                let ts = TrackTicks::from(ts.max(Timestamp::ZERO).get() as u64);
+
+                let after = self.clusters.partition_point(|&(time, _)| {
+                    time.into_track_ticks(track_timestamp_scale) <= ts
+                });
+                let cluster_pos =
+                    self.clusters[..after].last().map_or(self.first_cluster_pos, |&(_, pos)| pos);
+                let before = after.checked_sub(2).map(|i| self.clusters[i].1);
+
+                log::debug!("no cues, reading from the cluster at seg_pos={cluster_pos}");
+                (cluster_pos, None, before)
+            }
+        };
+
+        self.read_from_cluster(cluster_pos, cued_block_pos)?;
+
         // Seek to exact block.
-        self.seek_track_by_ts_forward(id, ts, required_ts)
+        self.seek_track_by_ts_forward(id, ts, required_ts, false, before)
+    }
+
+    /// Move the reader to the cluster at `cluster_pos` (relative to the Segment element's data),
+    /// with no frames queued: to its start or, if `cued_block_pos` leads to a block of it, to that
+    /// block once the cluster's Timestamp element is read.
+    fn read_from_cluster(&mut self, cluster_pos: u64, cued_block_pos: Option<u64>) -> Result<()> {
+        // Ascend back to the segment element. If the end of the segment was reached, the iterator
+        // has left the segment element, so return into it.
+        match self.iter.pop_elements_upto(MkvElement::Segment) {
+            Err(EbmlError::NotAnAncestor) => {
+                self.iter.restore_state(self.segment_state.clone())?;
+            }
+            result => result?,
+        }
+
+        // Seek to the specific cluster element.
+        self.iter.seek_to_child(cluster_pos)?;
+
+        // Resume iteration.
+        let cluster = match self.iter.next_header()? {
+            // The seeked element is a cluster.
+            Some(header) if header.element_type() == MkvElement::Cluster => header,
+            // The seeked element is not a cluster or there were no more elements at the cue
+            // position. The cue point was malformed.
+            _ => return seek_error(SeekErrorKind::Unseekable),
+        };
+
+        // Whether every element before the cluster has been read.
+        let read_before = cluster.pos() <= self.read_to;
+
+        // Descend into the cluster element.
+        self.iter.push_element()?;
+
+        self.read_all_before = read_before;
+
+        // While the first frame of an Opus track has not been read, a cluster before which every
+        // element has been read is read from its start, not from the cue point's block: the track's
+        // first frame may precede that block, and a frame is known to be the track's first only if
+        // every element before it has been read.
+        let from_start = read_before
+            && self
+                .track_states
+                .values()
+                .any(|state| state.opus.as_ref().is_some_and(|opus| !opus.knows_start()));
+
+        // Otherwise, if a cluster relative position leads to the block, seek to the exact simple
+        // block or block group element, once the cluster's timestamp is read.
+        let mut timestamp = None;
+
+        if let Some(cued_block_pos) = cued_block_pos.filter(|_| !from_start) {
+            timestamp = self.read_cluster_timestamp()?;
+
+            if timestamp.is_some() {
+                self.iter.seek_to_child(cued_block_pos)?;
+                self.read_all_before = self.iter.pos() <= self.read_to;
+            }
+            else {
+                // The cluster states no timestamp before its blocks. Read it from its start.
+                self.iter.seek_to_child(0)?;
+            }
+        }
+
+        // Update the current cluster metadata. Unless read above, the cluster's timestamp is read
+        // from its Timestamp element: a cue point states the time of its block.
+        self.current_cluster = Some(ClusterState { timestamp, start: cluster_pos });
+        self.frames.clear();
+
+        Ok(())
+    }
+
+    /// Read the children of the cluster the iterator has descended into, up to its Timestamp
+    /// element, which comes before its blocks (after a CRC-32 or Void element, if any), and return
+    /// the cluster's timestamp. Returns `None` if the cluster states no timestamp before a block,
+    /// or before its end.
+    fn read_cluster_timestamp(&mut self) -> Result<Option<SegmentTicks>> {
+        while let Some(child) = self.iter.next_header()? {
+            match child.element_type() {
+                MkvElement::Timestamp => return Ok(self.iter.read_u64()?.map(SegmentTicks::from)),
+                MkvElement::SimpleBlock | MkvElement::BlockGroup => return Ok(None),
+                // Other leading children (CRC-32, Void, Position, PrevSize) are skipped.
+                _ => (),
+            }
+        }
+
+        Ok(None)
     }
 
     fn next_element(&mut self) -> Result<bool> {
@@ -594,8 +833,8 @@ impl<'s> MkvReader<'s> {
                 match child.element_type() {
                     // Cluster element.
                     MkvElement::Cluster => {
-                        self.current_cluster =
-                            Some(ClusterState { timestamp: None, start: child.data_pos() });
+                        let start = child.pos() - self.segment_pos;
+                        self.current_cluster = Some(ClusterState { timestamp: None, start });
 
                         // Descend into the cluster.
                         self.iter.push_element()?;
@@ -605,7 +844,19 @@ impl<'s> MkvReader<'s> {
                         // Cluster timestamp element.
                         match self.current_cluster.as_mut() {
                             Some(cc) => {
-                                cc.timestamp = self.iter.read_u64()?.map(SegmentTicks::from)
+                                cc.timestamp = self.iter.read_u64()?.map(SegmentTicks::from);
+
+                                // Without cues, on a source that can seek, index a cluster read
+                                // past those indexed. The reader reads on from the first cluster
+                                // or from an indexed one, so the index holds every cluster from
+                                // the first to the last it holds.
+                                let index = self.cues.is_none()
+                                    && self.is_seekable
+                                    && self.clusters.last().is_none_or(|&(_, pos)| pos < cc.start);
+
+                                if let Some(timestamp) = cc.timestamp.filter(|_| index) {
+                                    self.clusters.push((timestamp, cc.start));
+                                }
                             }
                             _ => log::warn!("expected to have cluster"),
                         }
@@ -741,15 +992,14 @@ impl FormatReader for MkvReader<'_> {
                     }
                 };
                 let track_id = track.id;
-                self.seek_track_by_ts_atomic(track_id, tb, ts)
+                self.seek_track_by_ts_atomic(track_id, ts)
             }
             SeekTo::Timestamp { ts, track_id } => {
-                match self.tracks.iter().find(|t| t.id == track_id) {
-                    Some(track) => {
-                        let tb = track.time_base.expect("track always has a timebase");
-                        self.seek_track_by_ts_atomic(track_id, tb, ts)
-                    }
-                    None => seek_error(SeekErrorKind::InvalidTrack),
+                if self.tracks.iter().any(|t| t.id == track_id) {
+                    self.seek_track_by_ts_atomic(track_id, ts)
+                }
+                else {
+                    seek_error(SeekErrorKind::InvalidTrack)
                 }
             }
         }
@@ -769,11 +1019,13 @@ impl FormatReader for MkvReader<'_> {
                     frame.data,
                 );
 
-                // Trim the encoder delay and padding of an Opus track.
-                if let Some(opus) =
-                    self.track_states.get_mut(&frame.track_num).and_then(|s| s.opus.as_mut())
-                {
-                    opus.trim(&mut packet, frame.opus);
+                if let Some(state) = self.track_states.get_mut(&frame.track_num) {
+                    state.last_read = Some((frame.pts.into_ts(), frame.dur));
+
+                    // Trim the encoder delay and padding of an Opus track.
+                    if let Some(opus) = &mut state.opus {
+                        opus.trim(&mut packet, frame.opus);
+                    }
                 }
 
                 return Ok(Some(packet));

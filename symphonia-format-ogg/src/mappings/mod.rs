@@ -20,7 +20,7 @@ pub fn detect(serial: u32, buf: &[u8]) -> Result<Option<Box<dyn Mapper>>> {
     let mapper = flac::detect(serial, buf)?
         .or(vorbis::detect(serial, buf)?)
         .or(opus::detect(serial, buf)?)
-        .or_else(make_null_mapper);
+        .or_else(|| make_null_mapper(serial));
 
     Ok(mapper)
 }
@@ -74,7 +74,7 @@ pub trait Mapper: Send + Sync {
         Duration::new(0)
     }
 
-    /// Make a packet parser for parsing packet timing.
+    /// Make a packet parser for parsing packet timing, or `None` if the packets can't be timed.
     fn make_parser(&self) -> Option<Box<dyn PacketParser>>;
 
     /// Map a packet.
@@ -87,8 +87,8 @@ pub trait Mapper: Send + Sync {
     }
 }
 
-fn make_null_mapper() -> Option<Box<dyn Mapper>> {
-    Some(Box::new(NullMapper::new()))
+fn make_null_mapper(serial: u32) -> Option<Box<dyn Mapper>> {
+    Some(Box::new(NullMapper::new(serial)))
 }
 
 struct NullMapper {
@@ -96,8 +96,9 @@ struct NullMapper {
 }
 
 impl NullMapper {
-    fn new() -> Self {
-        NullMapper { track: Track::new(0) }
+    fn new(serial: u32) -> Self {
+        // The track of a stream is identified by the stream's serial, as for every mapper.
+        NullMapper { track: Track::new(serial) }
     }
 }
 
@@ -119,18 +120,13 @@ impl Mapper for NullMapper {
     }
 
     fn make_parser(&self) -> Option<Box<dyn PacketParser>> {
-        Some(Box::new(NullPacketParser {}))
+        // Nothing reads the stream's packets, so nothing times them: its granule positions are the
+        // codec's (Theora's count keyframes and the frames since), not timestamps. The stream
+        // states no start, length or padding.
+        None
     }
 
     fn map_packet(&mut self, _: &[u8]) -> Result<MapResult> {
         Ok(MapResult::Unknown)
-    }
-}
-
-struct NullPacketParser {}
-
-impl PacketParser for NullPacketParser {
-    fn parse_next_packet_dur(&mut self, _: &[u8]) -> (Duration, Duration) {
-        (Duration::ZERO, Duration::ZERO)
     }
 }

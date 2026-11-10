@@ -6,9 +6,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Opus in Ogg: the pre-skip and the end padding are trimmed by the reader, a seek takes the
-//! pre-roll and trims the pre-skip only at the start of the stream, wherever it lands, and every
-//! channel mapping family is carried to the decoder. The fixtures are made by
-//! `fixtures/regenerate.sh`.
+//! pre-roll and trims the pre-skip only at the start of the stream, wherever it lands, every
+//! channel mapping family is carried to the decoder, and the track's length and padding are read
+//! from its first and last pages. The fixtures are made by `fixtures/regenerate.sh`.
+
+mod common;
 
 use std::io::Cursor;
 use std::path::Path;
@@ -17,12 +19,14 @@ use symphonia_common::xiph::audio::opus::packet_frames;
 use symphonia_core::audio::Channels;
 use symphonia_core::checksum::Crc32;
 use symphonia_core::codecs::CodecParameters;
-use symphonia_core::errors::Error;
+use symphonia_core::errors::{Error, SeekErrorKind};
 use symphonia_core::formats::{FormatReader, SeekMode, SeekTo};
 use symphonia_core::io::{MediaSourceStream, Monitor};
 use symphonia_core::packet::Packet;
-use symphonia_core::units::{Time, Timestamp};
+use symphonia_core::units::{Duration, Time, Timestamp};
 use symphonia_format_ogg::OggReader;
+
+use common::within_deadline;
 
 /// The identification packet starts after the first page's 27-byte header and its 1-byte segment
 /// table.
@@ -145,94 +149,148 @@ fn a_single_page_stream_presents_exactly_its_length() {
 
     assert_eq!(reader.tracks()[0].start_ts, Timestamp::new(0));
     assert_eq!(reader.tracks()[0].num_frames, Some(12_000));
+    // The page's packets decode to the pre-skip, the stream and the padding: the end probe times
+    // the page's first packet as the stream's first, which follows no packet.
+    assert_eq!(reader.tracks()[0].padding, Some(168));
 
     let packets = packets(&mut reader);
     assert_eq!(presented(&packets), 12_000);
     assert_eq!(packets[0].pts, Timestamp::new(-312));
     assert_eq!(packets[0].trim_start.get(), 312);
+    assert_eq!(packets.last().unwrap().trim_end.get(), 168);
+}
+
+#[test]
+fn a_stream_that_starts_late_is_as_long_as_it_presents() {
+    // FFmpeg writes the stream 0.5 s late: the first page's granule position is 0.5 s past the
+    // samples it holds (RFC 7845, §4.5). The track presents 1 s from 0.5 s on.
+    within_deadline(|| {
+        let mut reader = open(fixture("opus_late.opus")).unwrap();
+
+        let track = reader.tracks()[0].clone();
+        assert_eq!(track.start_ts, Timestamp::new(24_000));
+        assert_eq!(track.num_frames, Some(48_000));
+        assert_eq!(track.duration, Some(Duration::new(48_000)));
+        assert_eq!(track.delay, Some(312));
+        assert_eq!(track.padding, Some(648));
+
+        let linear = packets(&mut reader);
+        assert_eq!(first_presented(&linear), 24_000);
+        assert_eq!(presented(&linear), 48_000);
+
+        // The track ends at its start plus its length: a seek there is in range, past it is not.
+        let to = SeekTo::Timestamp { ts: Timestamp::new(72_000), track_id: track.id };
+        reader.seek(SeekMode::Accurate, to).unwrap();
+        assert_tail_of(&packets(&mut reader), &linear, "a seek to the end");
+
+        let to = SeekTo::Timestamp { ts: Timestamp::new(72_001), track_id: track.id };
+        let err = reader.seek(SeekMode::Accurate, to).unwrap_err();
+        assert!(matches!(err, Error::SeekError(SeekErrorKind::OutOfRange)), "{err:?}");
+    });
+}
+
+#[test]
+fn the_padding_is_read_from_the_last_two_pages_wherever_they_begin() {
+    // The page before the last page of opus_big_pages.opus begins more than a maximum page's size
+    // before the end of the stream, so the reader's first look at the end does not reach it.
+    let data = fixture("opus_big_pages.opus");
+    let mut reader = open(data).unwrap();
+
+    let track = reader.tracks()[0].clone();
+    assert_eq!(track.num_frames, Some(105_600));
+    assert_eq!(track.padding, Some(648));
+    assert_eq!(packets(&mut reader).last().unwrap().trim_end.get(), 648);
 }
 
 #[test]
 fn a_seek_to_the_start_trims_the_pre_skip_again() {
-    for (name, length) in [("opus_stereo.opus", 48_000), ("opus_short.opus", 12_000)] {
-        let mut reader = open(fixture(name)).unwrap();
-        assert_eq!(presented(&packets(&mut reader)), length, "{name}");
+    within_deadline(|| {
+        for (name, length) in [("opus_stereo.opus", 48_000), ("opus_short.opus", 12_000)] {
+            let mut reader = open(fixture(name)).unwrap();
+            assert_eq!(presented(&packets(&mut reader)), length, "{name}");
 
-        let seeked =
-            reader.seek(SeekMode::Accurate, SeekTo::Time { time: Time::ZERO, track_id: None });
-        let seeked = seeked.unwrap();
-        assert_eq!(seeked.required_ts, Timestamp::new(0), "{name}");
-        assert_eq!(seeked.actual_ts, Timestamp::new(-312), "{name}");
+            let seeked =
+                reader.seek(SeekMode::Accurate, SeekTo::Time { time: Time::ZERO, track_id: None });
+            let seeked = seeked.unwrap();
+            assert_eq!(seeked.required_ts, Timestamp::new(0), "{name}");
+            assert_eq!(seeked.actual_ts, Timestamp::new(-312), "{name}");
 
-        let packets = packets(&mut reader);
-        assert_eq!(packets[0].trim_start.get(), 312, "{name}");
-        assert_eq!(presented(&packets), length, "{name}");
-    }
+            let packets = packets(&mut reader);
+            assert_eq!(packets[0].trim_start.get(), 312, "{name}");
+            assert_eq!(presented(&packets), length, "{name}");
+        }
+    });
 }
 
 #[test]
 fn a_seek_into_the_stream_takes_the_pre_roll_and_trims_nothing_at_the_start() {
-    let mut reader = open(fixture("opus_stereo.opus")).unwrap();
-    let track_id = reader.tracks()[0].id;
+    within_deadline(|| {
+        let mut reader = open(fixture("opus_stereo.opus")).unwrap();
+        let track_id = reader.tracks()[0].id;
 
-    let to = SeekTo::Timestamp { ts: Timestamp::new(24_000), track_id };
-    let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+        let to = SeekTo::Timestamp { ts: Timestamp::new(24_000), track_id };
+        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
 
-    // Decoding begins at least 80 ms (3840 frames) before the required timestamp.
-    assert_eq!(seeked.required_ts, Timestamp::new(24_000));
-    assert!(seeked.actual_ts <= Timestamp::new(24_000 - 3840), "{seeked:?}");
+        // Decoding begins at least 80 ms (3840 frames) before the required timestamp.
+        assert_eq!(seeked.required_ts, Timestamp::new(24_000));
+        assert!(seeked.actual_ts <= Timestamp::new(24_000 - 3840), "{seeked:?}");
 
-    let packets = packets(&mut reader);
-    assert_eq!(packets[0].pts, seeked.actual_ts);
-    assert_eq!(packets[0].trim_start.get(), 0, "no pre-skip in the middle of the stream");
-    assert_eq!(presented(&packets), 48_000 - seeked.actual_ts.get() as u64);
+        let packets = packets(&mut reader);
+        assert_eq!(packets[0].pts, seeked.actual_ts);
+        assert_eq!(packets[0].trim_start.get(), 0, "no pre-skip in the middle of the stream");
+        assert_eq!(presented(&packets), 48_000 - seeked.actual_ts.get() as u64);
+    });
 }
 
 #[test]
 fn a_seek_near_the_start_takes_the_whole_pre_roll() {
-    // The pre-skip trimmed from the first packet is decoded all the same, so a pre-roll that begins
-    // inside it begins at that packet.
-    let mut reader = open(fixture("opus_stereo.opus")).unwrap();
-    let track_id = reader.tracks()[0].id;
-    let linear = packets(&mut reader);
-    let start = linear[0].pts.get();
+    within_deadline(|| {
+        // The pre-skip trimmed from the first packet is decoded all the same, so a pre-roll that begins
+        // inside it begins at that packet.
+        let mut reader = open(fixture("opus_stereo.opus")).unwrap();
+        let track_id = reader.tracks()[0].id;
+        let linear = packets(&mut reader);
+        let start = linear[0].pts.get();
 
-    for ts in (0..=9600).step_by(120) {
-        let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+        for ts in (0..=9600).step_by(120) {
+            let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
 
-        // Decoding begins at least 80 ms before the required timestamp, or at the first packet.
-        assert!(seeked.actual_ts.get() <= (ts - PRE_ROLL).max(start), "{ts}: {seeked:?}");
-        assert_tail_of(&packets(&mut reader), &linear, &format!("a seek to {ts}"));
-    }
+            // Decoding begins at least 80 ms before the required timestamp, or at the first packet.
+            assert!(seeked.actual_ts.get() <= (ts - PRE_ROLL).max(start), "{ts}: {seeked:?}");
+            assert_tail_of(&packets(&mut reader), &linear, &format!("a seek to {ts}"));
+        }
+    });
 }
 
 #[test]
 fn a_seek_into_the_last_page_trims_its_padding() {
-    // The stream is large enough for a seek to bisect it, and its last page is one the bisection
-    // probes. That page's packets include the end padding, so its start is not its end less their
-    // duration: it is the end of the page before.
-    let data = fixture("opus_big_pages.opus");
-    assert!(data.len() > 2 * OGG_PAGE_MAX_SIZE, "a seek bisects the stream");
+    within_deadline(|| {
+        // The stream is large enough for a seek to bisect it, and its last page is one the bisection
+        // probes. That page's packets include the end padding, so its start is not its end less their
+        // duration: it is the end of the page before.
+        let data = fixture("opus_big_pages.opus");
+        assert!(data.len() > 2 * OGG_PAGE_MAX_SIZE, "a seek bisects the stream");
 
-    let mut reader = open(data).unwrap();
-    let track_id = reader.tracks()[0].id;
-    assert_eq!(reader.tracks()[0].num_frames, Some(105_600));
+        let mut reader = open(data).unwrap();
+        let track_id = reader.tracks()[0].id;
+        assert_eq!(reader.tracks()[0].num_frames, Some(105_600));
 
-    let linear = packets(&mut reader);
-    assert_eq!(presented(&linear), 105_600);
-    assert_eq!(linear.last().unwrap().trim_end.get(), 648);
+        let linear = packets(&mut reader);
+        assert_eq!(presented(&linear), 105_600);
+        assert_eq!(linear.last().unwrap().trim_end.get(), 648);
 
-    // The last page holds about the last 0.5 s. Seek to every 10 ms of the last second.
-    for ts in (105_600 - 48_000..=105_600).step_by(480) {
-        let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-        assert!(seeked.actual_ts.get() <= ts - PRE_ROLL, "{ts}: {seeked:?}");
+        // The last page holds about the last 0.5 s. Seek to every 10 ms of the last second.
+        for ts in (105_600 - 48_000..=105_600).step_by(480) {
+            let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+            assert!(seeked.actual_ts.get() <= ts - PRE_ROLL, "{ts}: {seeked:?}");
 
-        let after = packets(&mut reader);
-        assert_eq!(after[0].pts, seeked.actual_ts, "{ts}");
-        assert_tail_of(&after, &linear, &format!("a seek to {ts}"));
-    }
+            let after = packets(&mut reader);
+            assert_eq!(after[0].pts, seeked.actual_ts, "{ts}");
+            assert_tail_of(&after, &linear, &format!("a seek to {ts}"));
+        }
+    });
 }
 
 #[test]
@@ -265,29 +323,35 @@ fn a_pre_skip_longer_than_the_first_page_is_the_delay_and_is_trimmed_whole() {
 
 #[test]
 fn a_seek_landing_inside_a_long_pre_skip_trims_it() {
-    // With the largest pre-skip, the first ~89 KB of the stream are pre-skip, so the bisection of a
-    // seek near the start lands on a page inside it past the first page.
-    let mut data = fixture("opus_small_pages.opus");
-    assert!(data.len() > 2 * OGG_PAGE_MAX_SIZE, "a seek bisects the stream");
-    patch_pre_skip(&mut data, u16::MAX);
+    within_deadline(|| {
+        // With the largest pre-skip, the first ~89 KB of the stream are pre-skip, so the bisection of a
+        // seek near the start lands on a page inside it past the first page.
+        let mut data = fixture("opus_small_pages.opus");
+        assert!(data.len() > 2 * OGG_PAGE_MAX_SIZE, "a seek bisects the stream");
+        patch_pre_skip(&mut data, u16::MAX);
 
-    let mut reader = open(data).unwrap();
-    let track_id = reader.tracks()[0].id;
-    let linear = packets(&mut reader);
-    let length = presented(&linear);
+        let mut reader = open(data).unwrap();
+        let track_id = reader.tracks()[0].id;
+        let linear = packets(&mut reader);
+        let length = presented(&linear);
 
-    for ts in (0..=4800).step_by(480) {
-        let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
-        let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
-        assert!(seeked.actual_ts.get() <= ts - PRE_ROLL, "{ts}: {seeked:?}");
+        for ts in (0..=4800).step_by(480) {
+            let to = SeekTo::Timestamp { ts: Timestamp::new(ts), track_id };
+            let seeked = reader.seek(SeekMode::Accurate, to).unwrap();
+            assert!(seeked.actual_ts.get() <= ts - PRE_ROLL, "{ts}: {seeked:?}");
 
-        let after = packets(&mut reader);
-        assert_tail_of(&after, &linear, &format!("a seek to {ts}"));
+            let after = packets(&mut reader);
+            assert_tail_of(&after, &linear, &format!("a seek to {ts}"));
 
-        if ts == 0 {
-            assert_eq!(presented(&after), length, "a seek to the start presents the whole stream");
+            if ts == 0 {
+                assert_eq!(
+                    presented(&after),
+                    length,
+                    "a seek to the start presents the whole stream"
+                );
+            }
         }
-    }
+    });
 }
 
 #[test]

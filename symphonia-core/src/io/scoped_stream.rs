@@ -42,7 +42,7 @@ impl<B: ReadBytes> ScopedStream<B> {
 
     /// Ignores the remainder of the `ScopedStream`.
     pub fn ignore(&mut self) -> io::Result<()> {
-        self.inner.ignore_bytes(self.len - self.read)
+        self.ignore_bytes(self.len - self.read)
     }
 
     /// Convert the `ScopedStream` to the inner stream.
@@ -196,7 +196,11 @@ impl<B: ReadBytes + SeekBuffered> SeekBuffered for ScopedStream<B> {
     #[inline(always)]
     fn seek_buffered(&mut self, pos: u64) -> u64 {
         // Clamp the seekable position to within the bounds of the ScopedStream.
-        self.inner.seek_buffered(pos.clamp(self.start, self.start + self.len))
+        let pos = self.inner.seek_buffered(pos.clamp(self.start, self.start + self.len));
+        // The inner stream lands between where it was and the clamped position, both within the
+        // bounds. The bytes read are counted from the start to there: a seek back unreads them.
+        self.read = pos - self.start;
+        pos
     }
 
     #[inline(always)]
@@ -205,6 +209,11 @@ impl<B: ReadBytes + SeekBuffered> SeekBuffered for ScopedStream<B> {
         // within the bounds of the ScopedStream.
         let max_back = self.read.min(isize::MAX as u64) as isize;
         let max_forward = (self.len - self.read).min(isize::MAX as u64) as isize;
-        self.inner.seek_buffered_rel(delta.clamp(-max_back, max_forward))
+        let pos = self.inner.seek_buffered_rel(delta.clamp(-max_back, max_forward));
+        self.read = pos - self.start;
+        pos
     }
 }
+
+#[cfg(test)]
+mod tests;

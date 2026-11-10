@@ -270,18 +270,16 @@ impl<'s> OggReader<'s> {
         let actual_ts = loop {
             match self.peek_logical_packet() {
                 Some(packet) => {
-                    // Skip packets not belonging to the stream being seeked.
-                    if packet.track_id != serial {
-                        continue;
+                    // The packets of the other logical streams on the way are discarded too.
+                    if packet.track_id == serial {
+                        // The packet's decoded frames, the trimmed ones included, end at its PTS
+                        // plus its block duration.
+                        match packet.pts.checked_add(packet.block_dur()) {
+                            Some(next_packet_ts) if next_packet_ts < target_ts => (),
+                            // Packet exceeds the requested timestamp, or the representable range.
+                            _ => break packet.pts,
+                        };
                     }
-
-                    // The packet's decoded frames, the trimmed ones included, end at its PTS plus
-                    // its block duration.
-                    match packet.pts.checked_add(packet.block_dur()) {
-                        Some(next_packet_ts) if next_packet_ts < target_ts => (),
-                        // Packet exceeds the requested timestamp, or the representable range.
-                        _ => break packet.pts,
-                    };
 
                     self.discard_logical_packet();
                 }
@@ -532,15 +530,16 @@ impl FormatReader for OggReader<'_> {
             }
             // Time value given, calculate frame timestamp from sample rate.
             SeekTo::Time { time, track_id } => {
-                // Get the track serial.
+                // Get the track serial. Ogg flags no default track, so the default is the first
+                // track that can be timed: one with a timebase (a stream no mapper reads has none).
                 let serial = if let Some(serial) = track_id {
                     serial
                 }
-                else if let Some(first_track) = self.tracks.first() {
-                    first_track.id
+                else if let Some(track) = self.tracks.iter().find(|t| t.time_base.is_some()) {
+                    track.id
                 }
                 else {
-                    // No tracks.
+                    // No track can be timed.
                     return seek_error(SeekErrorKind::Unseekable);
                 };
 
